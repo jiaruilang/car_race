@@ -1,0 +1,220 @@
+version: "4.1"
+name: micro_smartcar
+type: ARM
+deviceName: null
+packDir: null
+srcDirs: []
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders:
+    - name: Application
+      files: []
+      folders:
+        - name: MDK-ARM
+          files:
+            - path: startup_stm32f103xb.s
+          folders: []
+        - name: User
+          files: []
+          folders:
+            - name: Core
+              files:
+                - path: ../Core/Src/main.c
+                - path: ../Core/Src/stm32f1xx_it.c
+                - path: ../Core/Src/stm32f1xx_hal_msp.c
+                - path: ../Core/Inc/race_app.h
+              folders: []
+    - name: Drivers
+      files: []
+      folders:
+        - name: STM32F1xx_HAL_Driver
+          files:
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_gpio_ex.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_spi.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc_ex.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_gpio.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_dma.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_cortex.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_pwr.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash_ex.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_exti.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim_ex.c
+            - path: ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c
+          folders: []
+        - name: CMSIS
+          files:
+            - path: ../Core/Src/system_stm32f1xx.c
+          folders: []
+    - name: BMI270
+      files:
+        - path: ../Core/code/bmi2.c
+        - path: ../Core/code/bmi2.h
+        - path: ../Core/code/bmi2_defs.h
+        - path: ../Core/code/bmi270.c
+        - path: ../Core/code/bmi270.h
+        - path: ../Core/code/bmi270_port.c
+        - path: ../Core/code/bmi270_port.h
+        - path: ../Core/code/dodo_BMI270.c
+        - path: ../Core/code/dodo_BMI270.h
+      folders: []
+    - name: code
+      files:
+        - path: ../Core/code/multiplexer.h
+        - path: ../Core/code/multiplexer.c
+        - path: ../Core/code/bmi270_port.c
+      folders: []
+    - name: ::CMSIS
+      files: []
+      folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: 7d2d0817235489995c5955f0f8f90516
+targets:
+  micro_smartcar:
+    cppPreprocessAttrs:
+      defineList:
+        - USE_HAL_DRIVER
+        - STM32F103xB
+      incList:
+        - ../Core/Inc
+        - ../Drivers/STM32F1xx_HAL_Driver/Inc
+        - ../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy
+        - ../Drivers/CMSIS/Device/ST/STM32F1xx/Include
+        - ../Drivers/CMSIS/Include
+        - ../Core/code
+        - .cmsis/include
+        - RTE/_micro_smartcar
+      libList: []
+    excludeList: []
+    settings:
+      debugger: cortex-debug
+    toolchain: AC6
+    toolchainConfigMap:
+      AC6:
+        archExtensions: ""
+        cpuType: Cortex-M3
+        floatingPointHardware: none
+        options:
+          version: 3
+          afterBuildTasks: []
+          asm-compiler:
+            $use: asm-auto
+            defines: []
+            misc-controls: ""
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            language-c: c99
+            language-cpp: c++03
+            link-time-optimization: false
+            one-elf-section-per-function: true
+            optimization: level-3
+            short-enums#wchar: true
+            warnings: ac5-like-warnings
+          global:
+            output-debug-info: enable
+            use-microLIB: true
+          linker:
+            $outputTaskExcludes:
+              - .bin
+            misc-controls: --diag_suppress=L6329
+            output-format: elf
+            ro-base: ""
+            rw-base: ""
+            xo-base: ""
+        scatterFilePath: ""
+        storageLayout:
+          RAM:
+            - id: 1
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 2
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 3
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 1
+              isChecked: true
+              mem:
+                size: "0x5000"
+                startAddr: "0x20000000"
+              noInit: false
+              tag: IRAM
+            - id: 2
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: IRAM
+          ROM:
+            - id: 1
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 2
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 3
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 1
+              isChecked: true
+              isStartup: true
+              mem:
+                size: "0x10000"
+                startAddr: "0x8000000"
+              tag: IROM
+            - id: 2
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: IROM
+        useCustomScatterFile: false
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: "null"
+          vendor: "null"
+        otherCmds: ""
+        proType: 1
+        speed: 8000
+      OpenOCD:
+        baseAddr: "0x08000000"
+        bin: ""
+        interface: stlink
+        target: stm32f1x
+    uploader: OpenOCD

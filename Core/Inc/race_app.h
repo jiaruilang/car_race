@@ -1,0 +1,273 @@
+#ifndef RACE_APP_H
+#define RACE_APP_H
+/* Include ONLY ONCE, in main.c USER CODE BEGIN 0, after peripheral handles.
+   No other .c file should include this implementation header. */
+#include "dodo_BMI270.h"
+#include "multiplexer.h"
+#include <math.h>
+#include <stdio.h>
+
+/* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
+   5 four left 90-degree turns; 6 basic line following (NO ring routing). */
+#define APP_MODE 3
+#define APP_MEASURED 1     /* set 1 only after ALL measurements below */
+#define LEFT_FORWARD_HIGH 1
+#define RIGHT_FORWARD_HIGH 0
+#define LEFT_ENCODER_SIGN 1
+#define RIGHT_ENCODER_SIGN -1
+#define GYRO_SIGN 1
+#define METRES_PER_COUNT_L 0.00002089f
+#define METRES_PER_COUNT_R 0.00002078f
+#define EFFECTIVE_TRACK_M 0.18f
+#define SPEED_KP_L 0.5f
+#define SPEED_KI_L 0.02f
+#define SPEED_KP_R 1.1f
+#define SPEED_KI_R 0.15f
+#define MAX_PWM 0.20f
+#define TEST_PWM 0.10f
+#define TEST_REVERSE 0
+#define TEST_SPEED_MPS 0.20f
+#define LINE_KP 1.0f       /* initial trial only; error range -1..1 */
+#define LINE_KD 0.0f
+#define HEADING_KP 2.0f
+#define TURN_KP 2.0f
+#define TURN_MAX_RAD_S 0.8f
+#define DISTANCE_KP 0.8f
+#define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
+#define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
+#define DT 0.005f
+#define PI_F 3.14159265359f
+
+extern struct bmi2_dev bmi270; /* defined in the official dodo_BMI270.c */
+static volatile uint32_t app_ms, app_last_completed;
+static volatile unsigned app_running, app_fault;
+static uint32_t app_last_sample, app_last_log, app_elapsed;
+static uint16_t app_prev_l, app_prev_r, app_mask;
+static int32_t app_counts_l, app_counts_r;
+static float app_s, app_yaw, app_il, app_ir, app_vl, app_vr;
+static float app_error_prev, app_line_prev, app_cmd_l, app_cmd_r;
+static float app_target_l, app_target_r;
+static float app_bias, app_bias_sum, app_bias_square, app_gz;
+static unsigned app_cal_samples, app_cal_ready, app_hold, app_quarter;
+static unsigned app_lost, app_settled, app_stall;
+static int app_imu_init;
+static unsigned app_key_prev=1, app_key_stable=1, app_key_ticks;
+static char app_tx[180];
+static unsigned app_tx_pos, app_tx_len;
+/* fault:1 init;2 acquisition;3 scheduling;4 calibration/missing parameters;
+   5 lost line;6 timeout;7 encoder jump;8 stall. Reset to clear fault. */
+static float app_clip(float x,float lo,float hi){return x<lo?lo:x>hi?hi:x;}
+static void App_Stop(void){
+    TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;
+    app_il=0;app_ir=0;app_cmd_l=0;app_cmd_r=0;
+    app_target_l=0;app_target_r=0;
+}
+static void app_fail(unsigned code){App_Stop();app_fault=code;}
+static int32_t app_delta(uint16_t n,uint16_t p){
+    uint32_t d=((uint32_t)n+65536u-p)&65535u;
+    return d>=32768u?(int32_t)d-65536:(int32_t)d;
+}
+/* Software deadline guard. ISR never does SPI, printf, delay or control maths. */
+static void App_Timer1ms(void){
+    ++app_ms;
+    if(app_running && (uint32_t)(app_ms-app_last_completed)>20u){
+        TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;app_fault=3;
+    }
+}
+static void app_motor(float left,float right){
+    float u[2]={left,right};
+    static int direction[2]={1,1};
+    uint32_t irq=__get_PRIMASK();
+    __disable_irq();
+    if(!app_running || app_fault){TIM1->CCR1=0;TIM1->CCR2=0;}
+    else for(int i=0;i<2;i++){
+        float a=app_clip(u[i],-MAX_PWM,MAX_PWM);
+        int sign=a>=0?1:-1;
+        /* Blank one full control interval before a direction reversal. */
+        if(sign!=direction[i]){a=0;direction[i]=sign;}
+        if(i==0){
+            TIM1->CCR1=0;
+            HAL_GPIO_WritePin(L_DIR_GPIO_Port,L_DIR_Pin,
+              ((sign>0)==(LEFT_FORWARD_HIGH!=0))?GPIO_PIN_SET:GPIO_PIN_RESET);
+            TIM1->CCR1=(uint32_t)(fabsf(a)*7200.0f);
+        }else{
+            TIM1->CCR2=0;
+            HAL_GPIO_WritePin(R_DIR_GPIO_Port,R_DIR_Pin,
+              ((sign>0)==(RIGHT_FORWARD_HIGH!=0))?GPIO_PIN_SET:GPIO_PIN_RESET);
+            TIM1->CCR2=(uint32_t)(fabsf(a)*7200.0f);
+        }
+    }
+    __set_PRIMASK(irq);
+}
+static float app_pi(float target,float actual,float *integral,float kp,float ki){
+    float e=target-actual,next=*integral+ki*e*DT;
+    float raw=kp*e+next,out=app_clip(raw,-MAX_PWM,MAX_PWM);
+    if(raw==out || (raw>out && e<0) || (raw<out && e>0))*integral=next;
+    return out;
+}
+static int app_parameters_ok(void){
+    return APP_MEASURED && METRES_PER_COUNT_L>0 && METRES_PER_COUNT_R>0 &&
+      EFFECTIVE_TRACK_M>0 && SPEED_KP_L>0 && SPEED_KP_R>0 &&
+      SPEED_KI_L>=0 && SPEED_KI_R>=0 && MAX_PWM>0 && MAX_PWM<=0.85f &&
+      TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.3f;
+}
+static int app_line(float *e){
+    float centers[12],best=10;int count=0,i=0,k=0;
+    while(i<12){
+        int sum=0,n=0;
+        while(i<12 && !MUX_GET_CHANNEL(app_mask,i))i++;
+        while(i<12 && MUX_GET_CHANNEL(app_mask,i)){sum+=i;n++;i++;}
+        if(n)centers[count++]=2.0f*((float)sum/n)/11.0f-1.0f;
+    }
+    if(!count)return 0;
+    for(i=0;i<count;i++)if(fabsf(centers[i]-app_line_prev)<best){
+        best=fabsf(centers[i]-app_line_prev);k=i;
+    }
+    *e=centers[k];app_line_prev=*e;return 1;
+}
+static void app_start(void){
+    if(APP_MODE==0 || app_fault)return;
+    if(!app_cal_ready || (APP_MODE>=3 && !app_parameters_ok())){app_fail(4);return;}
+    app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
+    app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
+    app_last_completed=app_ms;app_running=1;
+}
+static void app_control(float gz_rad){
+    float v=0,w=0,tl,tr;
+    if(!app_running){app_target_l=0;app_target_r=0;return;}
+    app_target_l=0;app_target_r=0;
+    app_elapsed+=5;
+    if(app_elapsed>120000u){app_fail(6);return;}
+    if(APP_MODE==1 || APP_MODE==2){
+        float u=TEST_REVERSE?-TEST_PWM:TEST_PWM;
+        if(app_elapsed>=1000u){App_Stop();return;}
+        app_cmd_l=APP_MODE==1?u:0;app_cmd_r=APP_MODE==2?u:0;
+        app_motor(app_cmd_l,app_cmd_r);return;
+    }
+    app_yaw+=gz_rad*DT;
+    if(APP_MODE==3){
+        v=TEST_SPEED_MPS;
+        if(app_elapsed>=10000u){App_Stop();return;}
+    }else if(APP_MODE==4){
+        float remaining=1.0f-app_s;
+        if(remaining<=0.005f){App_Stop();return;}
+        v=fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining);
+        w=app_clip(-HEADING_KP*app_yaw,-0.8f,0.8f);
+    }else if(APP_MODE==5){
+        float e=(app_quarter+1)*PI_F/2.0f-app_yaw;
+        if(fabsf(e)<0.025f && fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
+            app_motor(0,0);app_il=app_ir=0;app_hold+=5;
+            if(app_hold>=1000u){app_hold=0;app_quarter++;if(app_quarter>=4)App_Stop();}
+            return;
+        }
+        app_hold=0;w=app_clip(TURN_KP*e,-TURN_MAX_RAD_S,TURN_MAX_RAD_S);
+    }else if(APP_MODE==6){
+        float e;
+        if(!app_line(&e)){
+            app_motor(0,0);app_il=app_ir=0;app_lost+=5;
+            if(app_lost>=50)app_fail(5);return;
+        }
+        app_lost=0;
+        w=app_clip(-(LINE_KP*e+LINE_KD*(e-app_error_prev)/DT),-2,2);
+        app_error_prev=e;v=TEST_SPEED_MPS/(1+fabsf(w));
+    }
+    tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
+    app_target_l=tl;app_target_r=tr;
+    app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L);
+    app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R);
+    /* Sustained high effort with no motion: stop instead of heating a motor. */
+    if((fabsf(app_cmd_l)>MAX_PWM*0.9f && fabsf(app_vl)<0.003f)||
+       (fabsf(app_cmd_r)>MAX_PWM*0.9f && fabsf(app_vr)<0.003f))app_stall+=5;
+    else app_stall=0;
+    if(app_stall>=800u){app_fail(8);return;}
+    app_motor(app_cmd_l,app_cmd_r);
+}
+static void App_Init(void){
+    App_Stop();
+    if(APP_MODE<0 || APP_MODE>6 || MAX_PWM<=0 || MAX_PWM>0.85f ||
+       TEST_PWM<=0 || TEST_PWM>0.15f){app_fail(4);return;}
+    CoreDebug->DEMCR|=CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL|=DWT_CTRL_CYCCNTENA_Msk;
+    app_imu_init=dodo_BMI270_init();
+    if(app_imu_init!=0){app_fail(1);return;}
+    if(HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL)!=HAL_OK ||
+       HAL_TIM_Encoder_Start(&htim4,TIM_CHANNEL_ALL)!=HAL_OK){app_fail(1);return;}
+    app_prev_l=(uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    app_prev_r=(uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    if(HAL_TIM_Base_Start_IT(&htim2)!=HAL_OK)app_fail(1);
+}
+static void app_log(void){
+    /* Only this function owns UART3 TX during runtime. No blocking printf. */
+    if(app_tx_pos<app_tx_len && __HAL_UART_GET_FLAG(&huart3,UART_FLAG_TXE)){
+        huart3.Instance->DR=(uint8_t)app_tx[app_tx_pos++];
+    }
+    uint32_t period=APP_SCOPE?APP_SCOPE_PERIOD_MS:200u;
+    if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
+        int n;app_last_log=HAL_GetTick();
+        if(APP_SCOPE){
+            /* CH1 L target, CH2 L measured, CH3 R target, CH4 R measured (mm/s).
+               CH5 run, CH6 fault, CH7 calibrated, CH8 yaw (0.1 degree). */
+            float ltarget=(app_running && !app_fault)?app_target_l:0;
+            float rtarget=(app_running && !app_fault)?app_target_r:0;
+            n=snprintf(app_tx,sizeof(app_tx),
+              "%ld,%ld,%ld,%ld,%u,%u,%u,%ld\n",
+              (long)(ltarget*1000),(long)(app_vl*1000),
+              (long)(rtarget*1000),(long)(app_vr*1000),
+              app_running,app_fault,app_cal_ready,
+              (long)(app_yaw*1800/PI_F));
+        }else{
+            n=snprintf(app_tx,sizeof(app_tx),
+              "M%d run%u F%u cal%u key%u L%ld R%ld vL%ld vR%ld s%ld a%ld z%ld q%03X uL%ld uR%ld\r\n",
+              APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable,
+              (long)app_counts_l,(long)app_counts_r,(long)(app_vl*1000),
+              (long)(app_vr*1000),(long)(app_s*1000),(long)(app_yaw*1800/PI_F),
+              (long)(app_gz*10),(unsigned)app_mask,
+              (long)(app_cmd_l*1000),(long)(app_cmd_r*1000));
+        }
+        app_tx_len=n>0?(unsigned)n:0;
+        if(app_tx_len>=sizeof(app_tx))app_tx_len=sizeof(app_tx)-1;
+        app_tx_pos=0;
+    }
+}
+static void App_Poll(void){
+    uint32_t now=app_ms,gap=now-app_last_sample;
+    struct bmi2_sens_data acc,gyr;
+    uint16_t l,r;int32_t dl,dr;unsigned key;
+    app_log();
+    if(app_fault || gap<5u)return;
+    app_last_sample=now;
+    if(gap>7u){if(app_running){app_fail(3);return;}app_cal_samples=0;app_bias_sum=app_bias_square=0;}
+    l=(uint16_t)__HAL_TIM_GET_COUNTER(&htim3);r=(uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    dl=app_delta(l,app_prev_l);dr=app_delta(r,app_prev_r);app_prev_l=l;app_prev_r=r;
+    app_counts_l+=dl;app_counts_r+=dr; /* raw signs, also usable before scaling */
+    if(app_running && (dl>5000 || dl< -5000 || dr>5000 || dr< -5000)){app_fail(7);return;}
+    app_vl=dl*LEFT_ENCODER_SIGN*METRES_PER_COUNT_L/DT;
+    app_vr=dr*RIGHT_ENCODER_SIGN*METRES_PER_COUNT_R/DT;
+    if(app_running)app_s+=(app_vl+app_vr)*0.5f*DT;
+    MUX_get_value(&app_mask);
+    if(bmi270_get_accel_gyro(&bmi270,&acc,&gyr)!=BMI2_OK){app_fail(2);return;}
+    app_gz=BMI270_gyro_transition(gyr.gyr.z);
+    if(!isfinite(app_gz)){app_fail(2);return;}
+    if(!app_cal_ready){
+        if(dl || dr || fabsf(app_gz)>5.0f){app_cal_samples=0;app_bias_sum=app_bias_square=0;}
+        else{
+            app_bias_sum+=app_gz;app_bias_square+=app_gz*app_gz;app_cal_samples++;
+            if(app_cal_samples>=400){
+                app_bias=app_bias_sum/400;
+                if(app_bias_square/400-app_bias*app_bias<0.25f)app_cal_ready=1;
+                else{app_cal_samples=0;app_bias_sum=app_bias_square=0;}
+            }
+        }
+    }
+    key=HAL_GPIO_ReadPin(GPIO_RUN_GPIO_Port,GPIO_RUN_Pin)==GPIO_PIN_SET;
+    if(key==app_key_prev){if(app_key_ticks<4)app_key_ticks++;}
+    else{app_key_ticks=0;app_key_prev=key;}
+    if(app_key_ticks>=4 && key!=app_key_stable){
+        app_key_stable=key;
+        if(!key){if(app_running)App_Stop();else app_start();}
+    }
+    if(app_running && (uint32_t)(app_ms-now)>2u){app_fail(3);return;}
+    app_control((app_gz-app_bias)*GYRO_SIGN*PI_F/180.0f);
+    app_last_completed=app_ms;
+}
+#endif
