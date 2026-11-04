@@ -122,26 +122,105 @@ static int app_parameters_ok(void){
       MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
       TURN_TOL_RAD>0;
 }
-static int app_line(float *e){
-    float centers[12],best=10;int count=0,i=0,k=0;
-    while(i<12){
-        int sum=0,n=0;
-        while(i<12 && !MUX_GET_CHANNEL(app_mask,i))i++;
-        while(i<12 && MUX_GET_CHANNEL(app_mask,i)){sum+=i;n++;i++;}
-        if(n)centers[count++]=2.0f*((float)sum/n)/11.0f-1.0f;
+/* MODE6 trial settings. Channels 0..11 run from left to right. */
+#define TRACK_CRUISE TEST_SPEED_MPS
+#define ISLAND_SIDE 0 /* -1 left, +1 right, 0 stop at candidate for inspection */
+enum { FOLLOW, CROSS, BRANCH, SEARCH };
+static int track_state, edge_side, edge_age, fork_frames, clear_frames;
+static unsigned state_ms;
+static float entry_yaw;
+
+static void track_enter(int state){
+    track_state=state;
+    state_ms=0;
+    clear_frames=0;
+    entry_yaw=app_yaw;
+}
+static void track_reset(void){
+    track_enter(FOLLOW);
+    edge_side=0; edge_age=100; fork_frames=0;
+}
+static void track_control(float *v,float *w){
+    int starts[6],ends[6],groups=0,total=0,previous=0;
+    for(int i=0;i<12;i++){
+        int white=MUX_GET_CHANNEL(app_mask,i);
+        if(white){
+            if(!previous) starts[groups++]=i;
+            ends[groups-1]=i;
+            total++;
+        }
+        previous=white;
     }
-    if(!count)return 0;
-    for(i=0;i<count;i++)if(fabsf(centers[i]-app_line_prev)<best){
-        best=fabsf(centers[i]-app_line_prev);k=i;
+    int wide=(groups==1 && total>=10);
+    int fork=(groups>=2 && starts[0]==0 && ends[0]>=1 &&
+              ends[groups-1]==11 && starts[groups-1]<=10);
+    int central=(groups==1 && total<=6 && starts[0]<=6 && ends[0]>=5);
+    int side=0;
+    if(groups==1 && total<=6){
+        if(ends[0]<=3) side=-1;
+        if(starts[0]>=8) side=1;
     }
-    *e=centers[k];app_line_prev=*e;return 1;
+    if(edge_age<100) edge_age++;
+    if(track_state==FOLLOW && side){edge_side=side;edge_age=0;}
+    if(track_state==FOLLOW){
+        fork_frames=fork ? fork_frames+1 : 0;
+        if(wide) track_enter(CROSS);
+        else if(fork_frames>=3){
+            fork_frames=0;
+            if(!ISLAND_SIDE){app_fail(5);return;}
+            track_enter(BRANCH);
+        }else if(!total && edge_age<=24 && edge_side) track_enter(SEARCH);
+    }
+    if(track_state!=FOLLOW)state_ms+=5;
+    if(total || track_state==SEARCH || track_state==CROSS)app_lost=0;
+    if(track_state!=FOLLOW){
+        clear_frames=central ? clear_frames+1 : 0;
+        if(clear_frames>=3){
+            track_enter(FOLLOW);
+            edge_age=100;edge_side=0;
+            app_error_prev=(starts[0]+ends[0])/11.0f-1.0f;
+        }
+    }
+    if(track_state==SEARCH){
+        if(state_ms>1100){app_fail(5);return;}
+        *v=0; *w=-edge_side*2.3f; return;
+    }
+    if(track_state==CROSS){
+        if(state_ms>450){app_fail(5);return;}
+        *v=fminf(TRACK_CRUISE,0.18f);
+        *w=app_clip(HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
+        return;
+    }
+    if(track_state==BRANCH && state_ms>550){app_fail(5);return;}
+    if(!total){
+        if(track_state==BRANCH && state_ms<=200){
+            *v=0.05f; *w=-ISLAND_SIDE*1.5f; return;
+        }
+        app_motor(0,0);app_cmd_l=app_cmd_r=app_il=app_ir=0;
+        app_lost+=5;if(app_lost>=50)app_fail(5);
+        return;
+    }
+    app_lost=0;
+    int pick=0;
+    float best=10;
+    for(int i=0;i<groups;i++){
+        float dist=fabsf((starts[i]+ends[i])/11.0f-1.0f-app_line_prev);
+        if(dist<best){pick=i;best=dist;}
+    }
+    if(track_state==BRANCH) pick=ISLAND_SIDE<0 ? 0 : groups-1;
+    float e=(starts[pick]+ends[pick])/11.0f-1.0f;
+    *w=app_clip(-(LINE_KP*e+LINE_KD*(e-app_error_prev)/DT),-2,2);
+    app_error_prev=app_line_prev=e;
+    *v=TRACK_CRUISE/(1+fabsf(*w));
+    if(side && track_state==FOLLOW){*v=0.10f; *w=-side*2.2f;}
+    if(side || fork || track_state==BRANCH)*v=fminf(*v,0.15f);
 }
 static void app_start(void){
     if(APP_MODE==0 || app_fault)return;
     if(!app_cal_ready || (APP_MODE>=3 && !app_parameters_ok())){app_fail(4);return;}
     app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
     app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
-    app_last_completed=app_ms;app_running=1;
+    track_reset();app_last_completed=app_ms;app_running=1;
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
@@ -178,14 +257,8 @@ static void app_control(float gz_rad){
            wheels never stop and the settle check above can never pass. */
         floor_release=(fabsf(e)<TURN_TOL_RAD);
     }else if(APP_MODE==6){
-        float e;
-        if(!app_line(&e)){
-            app_motor(0,0);app_il=app_ir=0;app_lost+=5;
-            if(app_lost>=50)app_fail(5);return;
-        }
-        app_lost=0;
-        w=app_clip(-(LINE_KP*e+LINE_KD*(e-app_error_prev)/DT),-2,2);
-        app_error_prev=e;v=TEST_SPEED_MPS/(1+fabsf(w));
+        track_control(&v,&w);
+        if(!app_running || app_lost)return;
     }
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
     /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
@@ -194,13 +267,21 @@ static void app_control(float gz_rad){
        which is 0 while spinning. Released at a MODE5 target so the wheels can
        actually stop and the settle check can pass. MODE3/4 stay untouched. */
     if(MIN_SPEED_MPS>0.0f && !floor_release &&
-       (APP_MODE==5 || (APP_MODE==6 && MIN_SPEED_FLOOR_MODE6))){
+       APP_MODE==5){
         if(tl!=0.0f)tl=copysignf(fmaxf(fabsf(tl),MIN_SPEED_MPS),tl);
         if(tr!=0.0f)tr=copysignf(fmaxf(fabsf(tr),MIN_SPEED_MPS),tr);
     }
-    app_target_l=tl;app_target_r=tr;
-    float ffl=(APP_MODE==5)?SPEED_FF_TURN_L:SPEED_FF_L;
-    float ffr=(APP_MODE==5)?SPEED_FF_TURN_R:SPEED_FF_R;
+    if(APP_MODE==6 && MIN_SPEED_FLOOR_MODE6 && MIN_SPEED_MPS>0){
+        float outer=fmaxf(fabsf(tl),fabsf(tr));
+        if(outer>0 && outer<MIN_SPEED_MPS){
+            float scale=MIN_SPEED_MPS/outer;
+            tl*=scale; tr*=scale;
+        }
+        if(fabsf(tl)<0.5f*MIN_SPEED_MPS){tl=0;app_il=0;}
+        if(fabsf(tr)<0.5f*MIN_SPEED_MPS){tr=0;app_ir=0;}
+    }    app_target_l=tl;app_target_r=tr;
+    float ffl=(APP_MODE==5 || (APP_MODE==6 && track_state==SEARCH))?SPEED_FF_TURN_L:SPEED_FF_L;
+    float ffr=(APP_MODE==5 || (APP_MODE==6 && track_state==SEARCH))?SPEED_FF_TURN_R:SPEED_FF_R;
     app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,ffl);
     app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,ffr);
     /* Sustained high effort with no motion: stop instead of heating a motor. */
