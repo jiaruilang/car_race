@@ -9,7 +9,7 @@
 
 /* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
    5 four left 90-degree turns; 6 basic line following (NO ring routing). */
-#define APP_MODE 5
+#define APP_MODE 6
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
 #define RIGHT_FORWARD_HIGH 0
@@ -25,6 +25,8 @@
 #define SPEED_KI_R 0.2f
 #define SPEED_FF_L 0.15f    /* feedforward duty per (m/s) of target; 0=off; L/R independent */
 #define SPEED_FF_R 0.231f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
+#define SPEED_FF_TURN_L 0.28f  /* MODE5 only: spin-in-place load differs from straight running */
+#define SPEED_FF_TURN_R 0.47f /* tune = steady turn duty / steady turn wheel speed */
 #define MAX_PWM 0.30f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
@@ -34,13 +36,15 @@
 #define LINE_KP 1.0f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.0f
 #define HEADING_KP 2.0f
-#define TURN_KP 2.0f
+#define TURN_KP 1.0f
 #define TURN_MAX_RAD_S 4.0f
+#define TURN_TOL_RAD 0.025f  /* angle window for a completed quarter turn; also releases the speed floor */
+#define MIN_SPEED_FLOOR_MODE6 1 /* 1: apply the wheel-speed floor in MODE6 too; 0: line mode exempt */
 #define DISTANCE_KP 1.5f
 #define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
 #define DT 0.005f
-#define PI_F 3.14159265359f
+#define PI_F 3.6759265359f
 
 extern struct bmi2_dev bmi270; /* defined in the official dodo_BMI270.c */
 static volatile uint32_t app_ms, app_last_completed;
@@ -113,8 +117,10 @@ static int app_parameters_ok(void){
     return APP_MEASURED && METRES_PER_COUNT_L>0 && METRES_PER_COUNT_R>0 &&
       EFFECTIVE_TRACK_M>0 && SPEED_KP_L>0 && SPEED_KP_R>0 &&
       SPEED_KI_L>=0 && SPEED_KI_R>=0 && SPEED_FF_L>=0 && SPEED_FF_R>=0 &&
+      SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
       MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
-      MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0;
+      MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
+      TURN_TOL_RAD>0;
 }
 static int app_line(float *e){
     float centers[12],best=10;int count=0,i=0,k=0;
@@ -139,6 +145,7 @@ static void app_start(void){
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
+    unsigned floor_release=0; /* MODE5: let the wheels stop once the angle is reached */
     if(!app_running){app_target_l=0;app_target_r=0;return;}
     app_target_l=0;app_target_r=0;
     app_elapsed+=5;
@@ -156,17 +163,20 @@ static void app_control(float gz_rad){
     }else if(APP_MODE==4){
         float remaining=1.0f-app_s;
         if(remaining<=0.005f+STOP_AHEAD_M){App_Stop();return;}
-        /* Keep the body speed inside the realisable set; MODE3/5/6 stay untouched. */
+        /* Keep the body speed inside the realisable set; the wheel floor below covers MODE5/6. */
         v=fmaxf(MIN_SPEED_MPS,fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining));
         w=app_clip(-HEADING_KP*app_yaw,-0.8f,0.8f);
     }else if(APP_MODE==5){
         float e=(app_quarter+1)*PI_F/2.0f-app_yaw;
-        if(fabsf(e)<0.025f && fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
+        if(fabsf(e)<TURN_TOL_RAD && fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
             app_motor(0,0);app_il=app_ir=0;app_hold+=5;
             if(app_hold>=1000u){app_hold=0;app_quarter++;if(app_quarter>=4)App_Stop();}
             return;
         }
         app_hold=0;w=app_clip(TURN_KP*e,-TURN_MAX_RAD_S,TURN_MAX_RAD_S);
+        /* Inside the settle window the floor must be released, otherwise the
+           wheels never stop and the settle check above can never pass. */
+        floor_release=(fabsf(e)<TURN_TOL_RAD);
     }else if(APP_MODE==6){
         float e;
         if(!app_line(&e)){
@@ -178,9 +188,21 @@ static void app_control(float gz_rad){
         app_error_prev=e;v=TEST_SPEED_MPS/(1+fabsf(w));
     }
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
+    /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
+       on |target| and keeps the sign, so MODE5 still spins in place (opposite
+       signs) and MODE6 keeps its differential; it must NOT be applied to v,
+       which is 0 while spinning. Released at a MODE5 target so the wheels can
+       actually stop and the settle check can pass. MODE3/4 stay untouched. */
+    if(MIN_SPEED_MPS>0.0f && !floor_release &&
+       (APP_MODE==5 || (APP_MODE==6 && MIN_SPEED_FLOOR_MODE6))){
+        if(tl!=0.0f)tl=copysignf(fmaxf(fabsf(tl),MIN_SPEED_MPS),tl);
+        if(tr!=0.0f)tr=copysignf(fmaxf(fabsf(tr),MIN_SPEED_MPS),tr);
+    }
     app_target_l=tl;app_target_r=tr;
-    app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,SPEED_FF_L);
-    app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,SPEED_FF_R);
+    float ffl=(APP_MODE==5)?SPEED_FF_TURN_L:SPEED_FF_L;
+    float ffr=(APP_MODE==5)?SPEED_FF_TURN_R:SPEED_FF_R;
+    app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,ffl);
+    app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,ffr);
     /* Sustained high effort with no motion: stop instead of heating a motor. */
     if((fabsf(app_cmd_l)>MAX_PWM*0.9f && fabsf(app_vl)<0.003f)||
        (fabsf(app_cmd_r)>MAX_PWM*0.9f && fabsf(app_vr)<0.003f))app_stall+=5;
