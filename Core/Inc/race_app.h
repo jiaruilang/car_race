@@ -9,33 +9,33 @@
 
 /* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
    5 four left 90-degree turns; 6 basic line following (NO ring routing). */
-#define APP_MODE 4
+#define APP_MODE 5
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
 #define RIGHT_FORWARD_HIGH 0
 #define LEFT_ENCODER_SIGN 1
 #define RIGHT_ENCODER_SIGN -1
 #define GYRO_SIGN 1
-#define METRES_PER_COUNT_L 0.00001984f
-#define METRES_PER_COUNT_R 0.00001970f
+#define METRES_PER_COUNT_L 0.00002200f
+#define METRES_PER_COUNT_R 0.00002200f
 #define EFFECTIVE_TRACK_M 0.18f
 #define SPEED_KP_L 0.32f
 #define SPEED_KI_L 0.22f
-#define SPEED_KP_R 0.27f
+#define SPEED_KP_R 0.35f
 #define SPEED_KI_R 0.2f
-#define SPEED_FF_L 0.0f    /* feedforward duty per (m/s) of target; 0=off; L/R independent */
-#define SPEED_FF_R 0.0f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
+#define SPEED_FF_L 0.15f    /* feedforward duty per (m/s) of target; 0=off; L/R independent */
+#define SPEED_FF_R 0.231f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
 #define MAX_PWM 0.30f
-#define MIN_PWM_L 0.05f   /* deadzone floor: non-zero duty below this cannot keep a wheel turning */
-#define MIN_PWM_R 0.075f   /* tune L/R separately if the two motors differ */
-#define TEST_PWM 0.07f
+#define TEST_PWM 0.042f
 #define TEST_REVERSE 0
 #define TEST_SPEED_MPS 0.30f
+#define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
+#define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 1.0f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.0f
-#define HEADING_KP 3.5f
+#define HEADING_KP 2.0f
 #define TURN_KP 2.0f
-#define TURN_MAX_RAD_S 0.8f
+#define TURN_MAX_RAD_S 4.0f
 #define DISTANCE_KP 1.5f
 #define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
@@ -61,12 +61,6 @@ static unsigned app_tx_pos, app_tx_len;
 /* fault:1 init;2 acquisition;3 scheduling;4 calibration/missing parameters;
    5 lost line;6 timeout;7 encoder jump;8 stall. Reset to clear fault. */
 static float app_clip(float x,float lo,float hi){return x<lo?lo:x>hi?hi:x;}
-/* Lift a driving command out of the deadzone; never amplify an opposite-sign brake. */
-static float app_deadzone(float u,float target,float min_pwm){
-    if(u>0 && target>0 && u<min_pwm)return min_pwm;
-    if(u<0 && target<0 && u>-min_pwm)return -min_pwm;
-    return u;
-}
 static void App_Stop(void){
     TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;
     app_il=0;app_ir=0;app_cmd_l=0;app_cmd_r=0;
@@ -120,7 +114,7 @@ static int app_parameters_ok(void){
       EFFECTIVE_TRACK_M>0 && SPEED_KP_L>0 && SPEED_KP_R>0 &&
       SPEED_KI_L>=0 && SPEED_KI_R>=0 && SPEED_FF_L>=0 && SPEED_FF_R>=0 &&
       MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
-      MIN_PWM_L>0 && MIN_PWM_R>0 && MIN_PWM_L<MAX_PWM && MIN_PWM_R<MAX_PWM;
+      MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0;
 }
 static int app_line(float *e){
     float centers[12],best=10;int count=0,i=0,k=0;
@@ -151,7 +145,7 @@ static void app_control(float gz_rad){
     if(app_elapsed>120000u){app_fail(6);return;}
     if(APP_MODE==1 || APP_MODE==2){
         float u=TEST_REVERSE?-TEST_PWM:TEST_PWM;
-        if(app_elapsed>=1000u){App_Stop();return;}
+        if(app_elapsed>=10000u){App_Stop();return;}
         app_cmd_l=APP_MODE==1?u:0;app_cmd_r=APP_MODE==2?u:0;
         app_motor(app_cmd_l,app_cmd_r);return;
     }
@@ -161,8 +155,9 @@ static void app_control(float gz_rad){
         if(app_elapsed>=10000u){App_Stop();return;}
     }else if(APP_MODE==4){
         float remaining=1.0f-app_s;
-        if(remaining<=0.005f){App_Stop();return;}
-        v=fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining);
+        if(remaining<=0.005f+STOP_AHEAD_M){App_Stop();return;}
+        /* Keep the body speed inside the realisable set; MODE3/5/6 stay untouched. */
+        v=fmaxf(MIN_SPEED_MPS,fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining));
         w=app_clip(-HEADING_KP*app_yaw,-0.8f,0.8f);
     }else if(APP_MODE==5){
         float e=(app_quarter+1)*PI_F/2.0f-app_yaw;
@@ -186,8 +181,6 @@ static void app_control(float gz_rad){
     app_target_l=tl;app_target_r=tr;
     app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,SPEED_FF_L);
     app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,SPEED_FF_R);
-    app_cmd_l=app_deadzone(app_cmd_l,tl,MIN_PWM_L);
-    app_cmd_r=app_deadzone(app_cmd_r,tr,MIN_PWM_R);
     /* Sustained high effort with no motion: stop instead of heating a motor. */
     if((fabsf(app_cmd_l)>MAX_PWM*0.9f && fabsf(app_vl)<0.003f)||
        (fabsf(app_cmd_r)>MAX_PWM*0.9f && fabsf(app_vr)<0.003f))app_stall+=5;
