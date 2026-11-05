@@ -35,7 +35,8 @@
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 1.0f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.0f
-#define HEADING_KP 2.0f
+#define LINE_D_MAX 20.0f  /* clamp on de/dt so a stale error cannot kick the D term */
+#define HEADING_KP 2.0f   /* MODE4 only */
 #define TURN_KP 1.0f
 #define TURN_MAX_RAD_S 4.0f
 #define TURN_TOL_RAD 0.025f  /* angle window for a completed quarter turn; also releases the speed floor */
@@ -44,7 +45,9 @@
 #define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
 #define DT 0.005f
-#define PI_F 3.6759265359f
+#define PI_F 3.14159265358979f /* TRUE pi: physical dps->rad/s and log conversion ONLY */
+#define TURN_STEP_RAD (PI_F*0.5f) /* MODE5: target yaw per quarter; tune here for angle bias */
+#define TRACK_HEADING_KP 2.0f /* MODE6 CROSS: own heading-hold gain, independent of MODE4 */
 
 extern struct bmi2_dev bmi270; /* defined in the official dodo_BMI270.c */
 static volatile uint32_t app_ms, app_last_completed;
@@ -120,49 +123,80 @@ static int app_parameters_ok(void){
       SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
       MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
       MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
-      TURN_TOL_RAD>0;
+      TURN_TOL_RAD>0 && TURN_STEP_RAD>0 && TRACK_HEADING_KP>0 && LINE_D_MAX>0;
 }
 /* MODE6 trial settings. Channels 0..11 run from left to right. */
 #define TRACK_CRUISE TEST_SPEED_MPS
 #define ISLAND_SIDE 0 /* -1 left, +1 right, 0 stop at candidate for inspection */
+#define CENTRAL_TOTAL_MAX 9     /* widest single segment still a normal line (was 6: 7..9 grey band) */
+#define CENTRAL_WEIGHT_MAX 2.0f /* |weighted sum| below this => line is centred */
+#define CORNER_HALF_HITS 6      /* all 6 sensors on one side lit => corner */
+#define CORNER_WEIGHT_MIN 2.5f  /* |weighted sum| above this => one side dominates */
+#define CORNER_DWEIGHT_MIN 2.0f /* jump in weighted sum from last frame => shape change */
+#define CORNER_FRAMES 2         /* consecutive corner frames before latching a direction */
+#define CORNER_SLOW_MPS 0.12f   /* cruise cap while a corner is being approached */
+#define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 enum { FOLLOW, CROSS, BRANCH, SEARCH };
 static int track_state, edge_side, edge_age, fork_frames, clear_frames;
+static int corner_frames, track_d_ready;
 static unsigned state_ms;
-static float entry_yaw;
+static float entry_yaw, track_weight_prev;
 
 static void track_enter(int state){
     track_state=state;
     state_ms=0;
     clear_frames=0;
     entry_yaw=app_yaw;
+    track_d_ready=0; /* suppress the D term on the first frame back in FOLLOW */
 }
 static void track_reset(void){
     track_enter(FOLLOW);
     edge_side=0; edge_age=100; fork_frames=0;
+    corner_frames=0; track_weight_prev=0;
 }
 static void track_control(float *v,float *w){
     int starts[6],ends[6],groups=0,total=0,previous=0;
+    int left_hits=0,right_hits=0;
+    float weight=0;
     for(int i=0;i<12;i++){
         int white=MUX_GET_CHANNEL(app_mask,i);
         if(white){
             if(!previous) starts[groups++]=i;
             ends[groups-1]=i;
             total++;
+            /* Weighted sum of sensor positions in [-1,+1]: a corner lights one
+               whole side -> large |weight|; a cross lights the bar symmetrically
+               -> |weight| ~ 0. Continuous, so 7..9-wide segments are covered. */
+            weight+=2.0f*i/11.0f-1.0f;
+            if(i<6)left_hits++;else right_hits++;
         }
         previous=white;
     }
+    float dweight=weight-track_weight_prev;
+    track_weight_prev=weight; /* update before any early return */
     int wide=(groups==1 && total>=10);
     int fork=(groups>=2 && starts[0]==0 && ends[0]>=1 &&
               ends[groups-1]==11 && starts[groups-1]<=10);
-    int central=(groups==1 && total<=6 && starts[0]<=6 && ends[0]>=5);
+    int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
+                 fabsf(weight)<CENTRAL_WEIGHT_MAX);
+    /* Corner = one side dominates, or the overall weight jumped. Exclude the
+       symmetric wide/fork patterns so a cross is never latched as a corner. */
+    int corner=!wide && !fork && (left_hits>=CORNER_HALF_HITS ||
+               right_hits>=CORNER_HALF_HITS || fabsf(weight)>=CORNER_WEIGHT_MIN ||
+               fabsf(dweight)>=CORNER_DWEIGHT_MIN);
+    int corner_side=(fabsf(weight)>0.01f)?(weight>0.0f?1:-1):
+                    (right_hits>=left_hits?1:-1);
     int side=0;
     if(groups==1 && total<=6){
         if(ends[0]<=3) side=-1;
         if(starts[0]>=8) side=1;
     }
     if(edge_age<100) edge_age++;
-    if(track_state==FOLLOW && side){edge_side=side;edge_age=0;}
     if(track_state==FOLLOW){
+        if(corner){if(corner_frames<100)corner_frames++;}
+        else corner_frames=0;
+        if(corner_frames>=CORNER_FRAMES){edge_side=corner_side;edge_age=0;}
+        if(side){edge_side=side;edge_age=0;}
         fork_frames=fork ? fork_frames+1 : 0;
         if(wide) track_enter(CROSS);
         else if(fork_frames>=3){
@@ -186,13 +220,16 @@ static void track_control(float *v,float *w){
         *v=0; *w=-edge_side*2.3f; return;
     }
     if(track_state==CROSS){
-        if(state_ms>450){app_fail(5);return;}
+        if(state_ms>450){if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
         *v=fminf(TRACK_CRUISE,0.18f);
-        *w=app_clip(HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
+        *w=app_clip(TRACK_HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
         return;
     }
-    if(track_state==BRANCH && state_ms>550){app_fail(5);return;}
+    if(track_state==BRANCH && state_ms>550){
+        if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;
+    }
     if(!total){
+        track_d_ready=0; /* next line frame must not differentiate across the gap */
         if(track_state==BRANCH && state_ms<=200){
             *v=0.05f; *w=-ISLAND_SIDE*1.5f; return;
         }
@@ -209,11 +246,18 @@ static void track_control(float *v,float *w){
     }
     if(track_state==BRANCH) pick=ISLAND_SIDE<0 ? 0 : groups-1;
     float e=(starts[pick]+ends[pick])/11.0f-1.0f;
-    *w=app_clip(-(LINE_KP*e+LINE_KD*(e-app_error_prev)/DT),-2,2);
-    app_error_prev=app_line_prev=e;
+    /* Differentiate only when the previous frame also followed the line:
+       after a lost line / state switch a stale e divided by DT would kick w
+       to its limit. LINE_D_MAX caps the remaining single-frame jumps. */
+    float de=track_d_ready?app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
+    *w=app_clip(-(LINE_KP*e+LINE_KD*de),-2,2);
+    app_error_prev=app_line_prev=e;track_d_ready=1;
     *v=TRACK_CRUISE/(1+fabsf(*w));
-    if(side && track_state==FOLLOW){*v=0.10f; *w=-side*2.2f;}
-    if(side || fork || track_state==BRANCH)*v=fminf(*v,0.15f);
+    /* Corner approach: cap speed by how far the lit pattern has shifted, but
+       keep the PD steering instead of overriding w with a fixed bang-bang. */
+    if(track_state==FOLLOW && (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
+        *v=fminf(*v,CORNER_SLOW_MPS);
+    if(fork || track_state==BRANCH)*v=fminf(*v,0.15f);
 }
 static void app_start(void){
     if(APP_MODE==0 || app_fault)return;
@@ -246,7 +290,7 @@ static void app_control(float gz_rad){
         v=fmaxf(MIN_SPEED_MPS,fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining));
         w=app_clip(-HEADING_KP*app_yaw,-0.8f,0.8f);
     }else if(APP_MODE==5){
-        float e=(app_quarter+1)*PI_F/2.0f-app_yaw;
+        float e=(app_quarter+1)*TURN_STEP_RAD-app_yaw;
         if(fabsf(e)<TURN_TOL_RAD && fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
             app_motor(0,0);app_il=app_ir=0;app_hold+=5;
             if(app_hold>=1000u){app_hold=0;app_quarter++;if(app_quarter>=4)App_Stop();}
