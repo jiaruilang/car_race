@@ -33,8 +33,8 @@
 #define TEST_SPEED_MPS 0.30f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
-#define LINE_KP 1.0f       /* initial trial only; error range -1..1 */
-#define LINE_KD 0.0f
+#define LINE_KP 2.0f       /* initial trial only; error range -1..1 */
+#define LINE_KD 0.02f
 #define LINE_D_MAX 20.0f  /* clamp on de/dt so a stale error cannot kick the D term */
 #define HEADING_KP 2.0f   /* MODE4 only */
 #define TURN_KP 1.0f
@@ -127,32 +127,69 @@ static int app_parameters_ok(void){
 }
 /* MODE6 trial settings. Channels 0..11 run from left to right. */
 #define TRACK_CRUISE TEST_SPEED_MPS
-#define ISLAND_SIDE 0 /* -1 left, +1 right, 0 stop at candidate for inspection */
+#define ISLAND_SIDE -1 /* -1 left, +1 right, 0 stop at candidate for inspection */
 #define CENTRAL_TOTAL_MAX 9     /* widest single segment still a normal line (was 6: 7..9 grey band) */
 #define CENTRAL_WEIGHT_MAX 2.0f /* |weighted sum| below this => line is centred */
 #define CORNER_HALF_HITS 6      /* all 6 sensors on one side lit => corner */
 #define CORNER_WEIGHT_MIN 2.5f  /* |weighted sum| above this => one side dominates */
-#define CORNER_DWEIGHT_MIN 2.0f /* jump in weighted sum from last frame => shape change */
-#define CORNER_FRAMES 2         /* consecutive corner frames before latching a direction */
-#define CORNER_SLOW_MPS 0.12f   /* cruise cap while a corner is being approached */
+#define CORNER_DWEIGHT_MIN 1.5f /* jump in weighted sum from last frame => shape change */
+#define CORNER_FRAMES 2         /* opposite-sign frames needed to flip a latched direction */
+#define CORNER_SLOW_MPS 0.20f   /* cruise cap while a corner is being approached */
 #define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
+/* ---- Fork / island entry ---- */
+#define FORK_STRICT 0         /* 1 = legacy: outer segments must touch ch0 and ch11 */
+#define FORK_EDGE_MARGIN 2    /* allowed margin at both ends: left start <=2, right end >=9 */
+#define FORK_GAP_MIN 2        /* min blank channels between the two outer segments */
+#define FORK_SEG_MIN 1        /* min width of each outer segment (1 allows a single lit sensor) */
+#define FORK_FRAMES 3         /* consecutive fork frames before entering BRANCH */
+/* ---- Continuous bend handling: weight/total is the line centre, dbend is its
+       per-frame change (width-free), severity drives a graded slowdown. ---- */
+#define BEND_ENABLE 1          /* 0 = fall back to the old weight-only corner test */
+#define BEND_RATE_K 0.8f      /* weight of |dbend| in severity */
+#define BEND_SLOW_K 1.0f      /* graded slowdown strength; 0 = only the old binary cap */
+#define BEND_SEARCH_MIN 0.80f /* severity above this opens the SEARCH window */
+#define BEND_DBEND_MAX 1.0f   /* clamp on a single-frame bend change */
+/* B-tier strategies: both OFF by default, switch on independently. */
+#define BEND_KP_ENABLE 0      /* B-tier 1: gain scheduling */
+#define BEND_KP_K 0.5f        /* strength used when BEND_KP_ENABLE is 1 */
+#define BEND_D_USE_DBEND 0    /* B-tier 2: use dbend instead of de as the D input */
+#define BEND_D_SCALE 200.0f   /* align dbend (per frame) with de (per second) */
+/* ---- Direction latching ---- */
+#define SIDE_ENABLE 1         /* 0 off (recommended); 1 fallback if corner silent; 2 legacy override */
+#define EDGE_LATCH 1          /* 1: hold a latched side until the window dies or SEARCH exits */
+#define SEARCH_SPIN_W 3.0f   /* spin rate while finding the line */
+#define SEARCH_SPIN_DIR -1    /* +1/-1: flip if SEARCH spins away from the line */
+/* ---- Exit from a special state ---- */
+#define EXIT_FRAMES 3         /* consecutive valid frames before returning to FOLLOW */
+#define SEARCH_EXIT_MODE 1    /* 0 centred only; 1 any single line; 2 line moving toward centre */
+#define BRANCH_EXIT_MODE 2    /* 0 centred only; 1 any line + dwell; 2 + yaw; 3 + distance */
+#define BRANCH_MIN_MS 100u    /* minimum dwell in BRANCH before an exit is allowed */
+#define BRANCH_MIN_YAW 0.50f  /* rad of heading change for BRANCH_EXIT_MODE 2 */
+#define BRANCH_MIN_DIST 0.15f /* metres travelled for BRANCH_EXIT_MODE 3 */
+#define CROSS_TIMEOUT_MS 450u
+#define BRANCH_TIMEOUT_MS 550u
+#define SEARCH_TIMEOUT_MS 1100u
+#define BRANCH_NUDGE_MS 200u
 enum { FOLLOW, CROSS, BRANCH, SEARCH };
 static int track_state, edge_side, edge_age, fork_frames, clear_frames;
-static int corner_frames, track_d_ready;
+static int side_flip_frames, track_d_ready, track_bend_ready;
 static unsigned state_ms;
-static float entry_yaw, track_weight_prev;
+static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 
 static void track_enter(int state){
     track_state=state;
     state_ms=0;
     clear_frames=0;
     entry_yaw=app_yaw;
-    track_d_ready=0; /* suppress the D term on the first frame back in FOLLOW */
+    entry_s=app_s;
+    track_d_ready=0;     /* suppress the D term on the first frame back in FOLLOW */
+    track_bend_ready=0;  /* suppress a fake dbend jump on the first frame back */
 }
 static void track_reset(void){
     track_enter(FOLLOW);
     edge_side=0; edge_age=100; fork_frames=0;
-    corner_frames=0; track_weight_prev=0;
+    side_flip_frames=0; track_weight_prev=0;
+    track_bend_prev=0; track_bend_ready=0;
 }
 static void track_control(float *v,float *w){
     int starts[6],ends[6],groups=0,total=0,previous=0;
@@ -173,17 +210,45 @@ static void track_control(float *v,float *w){
         previous=white;
     }
     float dweight=weight-track_weight_prev;
+    float prev_abs=fabsf(track_weight_prev);
     track_weight_prev=weight; /* update before any early return */
-    int wide=(groups==1 && total>=10);
-    int fork=(groups>=2 && starts[0]==0 && ends[0]>=1 &&
-              ends[groups-1]==11 && starts[groups-1]<=10);
+    /* weight/total == segment centre e for one run; dbend is its per-frame
+       change, free of line-width changes. Kept before every early return so
+       a state switch cannot fake a jump on the frame we come back. */
+    float bend=total?weight/(float)total:0.0f;
+    float dbend=(BEND_ENABLE && track_bend_ready)?
+        app_clip(bend-track_bend_prev,-BEND_DBEND_MAX,BEND_DBEND_MAX):0.0f;
+    track_bend_prev=bend;
+    track_bend_ready=1;
+    float severity=BEND_ENABLE?(fabsf(bend)+BEND_RATE_K*fabsf(dbend)):0.0f;
+    int wide=(groups==1 && total>=12);
+    /* A fork is two separated lit groups straddling the bar. The old test
+       required them to touch ch0 and ch11 exactly, which is easily missed
+       when the car is off-centre at an island entry. */
+    int fork=0;
+    if(groups>=2){
+        int last=groups-1;
+        int w0=ends[0]-starts[0]+1;
+        int wN=ends[last]-starts[last]+1;
+        int gap=starts[last]-ends[0]-1;
+        if(FORK_STRICT)
+            fork=(starts[0]==0 && ends[0]>=1 &&
+                  ends[last]==11 && starts[last]<=10);
+        else
+            fork=(starts[0]<=FORK_EDGE_MARGIN &&
+                  ends[last]>=11-FORK_EDGE_MARGIN &&
+                  gap>=FORK_GAP_MIN && w0>=FORK_SEG_MIN && wN>=FORK_SEG_MIN);
+    }
     int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
                  fabsf(weight)<CENTRAL_WEIGHT_MAX);
-    /* Corner = one side dominates, or the overall weight jumped. Exclude the
-       symmetric wide/fork patterns so a cross is never latched as a corner. */
-    int corner=!wide && !fork && (left_hits>=CORNER_HALF_HITS ||
-               right_hits>=CORNER_HALF_HITS || fabsf(weight)>=CORNER_WEIGHT_MIN ||
-               fabsf(dweight)>=CORNER_DWEIGHT_MIN);
+    /* Severity drives the graded slowdown for EVERY bend; this boolean only
+       opens the SEARCH window, i.e. the extreme end of the same scale. The
+       one-side-all-lit test stays as a hard backstop. */
+    int corner=!wide && !fork && (BEND_ENABLE ?
+        (severity>=BEND_SEARCH_MIN || left_hits>=CORNER_HALF_HITS ||
+         right_hits>=CORNER_HALF_HITS) :
+        (left_hits>=CORNER_HALF_HITS || right_hits>=CORNER_HALF_HITS ||
+         fabsf(weight)>=CORNER_WEIGHT_MIN || fabsf(dweight)>=CORNER_DWEIGHT_MIN));
     int corner_side=(fabsf(weight)>0.01f)?(weight>0.0f?1:-1):
                     (right_hits>=left_hits?1:-1);
     int side=0;
@@ -193,13 +258,26 @@ static void track_control(float *v,float *w){
     }
     if(edge_age<100) edge_age++;
     if(track_state==FOLLOW){
-        if(corner){if(corner_frames<100)corner_frames++;}
-        else corner_frames=0;
-        if(corner_frames>=CORNER_FRAMES){edge_side=corner_side;edge_age=0;}
-        if(side){edge_side=side;edge_age=0;}
+        if(corner){
+            /* One frame is enough to open the window and latch a direction:
+               a gradual bend may show an edge pattern for only one frame.
+               Once latched, a flip needs CORNER_FRAMES consistent frames. */
+            edge_age=0;
+            if(!EDGE_LATCH || !edge_side){
+                edge_side=corner_side;side_flip_frames=0;
+            }else if(corner_side!=edge_side){
+                if(++side_flip_frames>=CORNER_FRAMES){
+                    edge_side=corner_side;side_flip_frames=0;
+                }
+            }else side_flip_frames=0;
+        }else side_flip_frames=0;
+        /* Legacy single-frame shortcut. Default OFF: it used to overwrite the
+           corner direction and could reverse the turn right before line loss. */
+        if(SIDE_ENABLE==1 && side && !corner && !edge_side){edge_side=side;edge_age=0;}
+        if(SIDE_ENABLE==2 && side){edge_side=side;edge_age=0;}
         fork_frames=fork ? fork_frames+1 : 0;
         if(wide) track_enter(CROSS);
-        else if(fork_frames>=3){
+        else if(fork_frames>=FORK_FRAMES){
             fork_frames=0;
             if(!ISLAND_SIDE){app_fail(5);return;}
             track_enter(BRANCH);
@@ -208,29 +286,47 @@ static void track_control(float *v,float *w){
     if(track_state!=FOLLOW)state_ms+=5;
     if(total || track_state==SEARCH || track_state==CROSS)app_lost=0;
     if(track_state!=FOLLOW){
-        clear_frames=central ? clear_frames+1 : 0;
-        if(clear_frames>=3){
+        /* "Line found" is deliberately looser than "centred": leaving a corner
+           the line enters from the edge of the bar, so demanding a centred
+           pattern would keep spinning and overshoot. */
+        int seen=(groups==1 && total>0 && total<=CENTRAL_TOTAL_MAX);
+        int exit_ok;
+        if(track_state==SEARCH){
+            exit_ok=(SEARCH_EXIT_MODE==0)?central:seen;
+            if(SEARCH_EXIT_MODE==2)exit_ok=exit_ok && fabsf(weight)<prev_abs;
+        }else if(track_state==BRANCH){
+            exit_ok=(BRANCH_EXIT_MODE==0)?central:
+                    (seen && state_ms>=BRANCH_MIN_MS);
+            if(BRANCH_EXIT_MODE==2)
+                exit_ok=exit_ok && fabsf(app_yaw-entry_yaw)>=BRANCH_MIN_YAW;
+            if(BRANCH_EXIT_MODE==3)
+                exit_ok=exit_ok && (app_s-entry_s)>=BRANCH_MIN_DIST;
+        }else exit_ok=central; /* CROSS keeps the centred test */
+        clear_frames=exit_ok ? clear_frames+1 : 0;
+        if(clear_frames>=EXIT_FRAMES){
             track_enter(FOLLOW);
             edge_age=100;edge_side=0;
-            app_error_prev=(starts[0]+ends[0])/11.0f-1.0f;
+            /* Reset BOTH references: a stale app_line_prev would make the first
+               post-exit frame pick a segment near the pre-state line position. */
+            app_error_prev=app_line_prev=(starts[0]+ends[0])/11.0f-1.0f;
         }
     }
     if(track_state==SEARCH){
-        if(state_ms>1100){app_fail(5);return;}
-        *v=0; *w=-edge_side*2.3f; return;
+        if(state_ms>SEARCH_TIMEOUT_MS){app_fail(5);return;}
+        *v=0; *w=SEARCH_SPIN_DIR*edge_side*SEARCH_SPIN_W; return;
     }
     if(track_state==CROSS){
-        if(state_ms>450){if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
+        if(state_ms>CROSS_TIMEOUT_MS){if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
         *v=fminf(TRACK_CRUISE,0.18f);
         *w=app_clip(TRACK_HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
         return;
     }
-    if(track_state==BRANCH && state_ms>550){
+    if(track_state==BRANCH && state_ms>BRANCH_TIMEOUT_MS){
         if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;
     }
     if(!total){
         track_d_ready=0; /* next line frame must not differentiate across the gap */
-        if(track_state==BRANCH && state_ms<=200){
+        if(track_state==BRANCH && state_ms<=BRANCH_NUDGE_MS){
             *v=0.05f; *w=-ISLAND_SIDE*1.5f; return;
         }
         app_motor(0,0);app_cmd_l=app_cmd_r=app_il=app_ir=0;
@@ -250,9 +346,20 @@ static void track_control(float *v,float *w){
        after a lost line / state switch a stale e divided by DT would kick w
        to its limit. LINE_D_MAX caps the remaining single-frame jumps. */
     float de=track_d_ready?app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
-    *w=app_clip(-(LINE_KP*e+LINE_KD*de),-2,2);
+    /* B-tier option 2: dbend covers the whole lit pattern, so a segment switch
+       cannot kick it. BEND_D_SCALE puts it in the same units as de. */
+    float dterm=(BEND_ENABLE && BEND_D_USE_DBEND)?
+        app_clip(dbend*BEND_D_SCALE,-LINE_D_MAX,LINE_D_MAX):de;
+    float kp=LINE_KP;
+    /* B-tier option 1: gain scheduling, inert while BEND_KP_ENABLE is 0. */
+    if(BEND_ENABLE && BEND_KP_ENABLE)kp*=1.0f+BEND_KP_K*severity;
+    *w=app_clip(-(kp*e+LINE_KD*dterm),-2,2);
     app_error_prev=app_line_prev=e;track_d_ready=1;
     *v=TRACK_CRUISE/(1+fabsf(*w));
+    /* Graded slowdown: every bend reduces v, not just a right-angle corner.
+       The old binary cap remains as the extreme end of the same scale. */
+    if(BEND_ENABLE && BEND_SLOW_K>0.0f)
+        *v=fminf(*v,TRACK_CRUISE/(1.0f+BEND_SLOW_K*severity));
     /* Corner approach: cap speed by how far the lit pattern has shifted, but
        keep the PD steering instead of overriding w with a fixed bang-bang. */
     if(track_state==FOLLOW && (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
