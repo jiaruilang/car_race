@@ -138,7 +138,7 @@ static int app_parameters_ok(void){
 #define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 /* ---- Fork / island entry ---- */
 #define FORK_STRICT 0         /* 1 = legacy: outer segments must touch ch0 and ch11 */
-#define FORK_EDGE_MARGIN 2    /* allowed margin at both ends: left start <=2, right end >=9 */
+#define FORK_EDGE_MARGIN 3    /* allowed margin at both ends: left start <=2, right end >=9 */
 #define FORK_GAP_MIN 2        /* min blank channels between the two outer segments */
 #define FORK_SEG_MIN 1        /* min width of each outer segment (1 allows a single lit sensor) */
 #define FORK_FRAMES 3         /* consecutive fork frames before entering BRANCH */
@@ -162,7 +162,7 @@ static int app_parameters_ok(void){
 /* ---- Exit from a special state ---- */
 #define EXIT_FRAMES 3         /* consecutive valid frames before returning to FOLLOW */
 #define SEARCH_EXIT_MODE 1    /* 0 centred only; 1 any single line; 2 line moving toward centre */
-#define BRANCH_EXIT_MODE 2    /* 0 centred only; 1 any line + dwell; 2 + yaw; 3 + distance */
+#define BRANCH_EXIT_MODE 1    /* 0 centred only; 1 any line + dwell; 2 + yaw; 3 + distance */
 #define BRANCH_MIN_MS 100u    /* minimum dwell in BRANCH before an exit is allowed */
 #define BRANCH_MIN_YAW 0.50f  /* rad of heading change for BRANCH_EXIT_MODE 2 */
 #define BRANCH_MIN_DIST 0.15f /* metres travelled for BRANCH_EXIT_MODE 3 */
