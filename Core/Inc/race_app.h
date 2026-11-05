@@ -137,11 +137,11 @@ static int app_parameters_ok(void){
 #define CORNER_SLOW_MPS 0.20f   /* cruise cap while a corner is being approached */
 #define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 /* ---- Fork / island entry ---- */
-#define FORK_STRICT 0         /* 1 = legacy: outer segments must touch ch0 and ch11 */
-#define FORK_EDGE_MARGIN 3    /* allowed margin at both ends: left start <=2, right end >=9 */
-#define FORK_GAP_MIN 2        /* min blank channels between the two outer segments */
-#define FORK_SEG_MIN 1        /* min width of each outer segment (1 allows a single lit sensor) */
-#define FORK_FRAMES 3         /* consecutive fork frames before entering BRANCH */
+#define FORK_MODE 1           /* 0 legacy both ends; 1 one edge segment + another (real car); 2 any two groups */
+#define FORK_EDGE_MARGIN 3    /* an edge segment starts <=3 or ends >=8 */
+#define FORK_GAP_MIN 1        /* min blank channels between the two groups */
+#define FORK_SEG_MIN 1        /* min width of each group; 1 allows a single lit sensor */
+#define FORK_FRAMES 2         /* consecutive fork frames before entering BRANCH */
 /* ---- Continuous bend handling: weight/total is the line centre, dbend is its
        per-frame change (width-free), severity drives a graded slowdown. ---- */
 #define BEND_ENABLE 1          /* 0 = fall back to the old weight-only corner test */
@@ -155,25 +155,47 @@ static int app_parameters_ok(void){
 #define BEND_D_USE_DBEND 0    /* B-tier 2: use dbend instead of de as the D input */
 #define BEND_D_SCALE 200.0f   /* align dbend (per frame) with de (per second) */
 /* ---- Direction latching ---- */
-#define SIDE_ENABLE 1         /* 0 off (recommended); 1 fallback if corner silent; 2 legacy override */
+#define SIDE_ENABLE 1         /* fixed: fallback only; modes 0 (off) and 2 (override) removed */
 #define EDGE_LATCH 1          /* 1: hold a latched side until the window dies or SEARCH exits */
 #define SEARCH_SPIN_W 3.0f   /* spin rate while finding the line */
 #define SEARCH_SPIN_DIR -1    /* +1/-1: flip if SEARCH spins away from the line */
 /* ---- Exit from a special state ---- */
 #define EXIT_FRAMES 3         /* consecutive valid frames before returning to FOLLOW */
 #define SEARCH_EXIT_MODE 1    /* 0 centred only; 1 any single line; 2 line moving toward centre */
+/* Legacy pattern-based BRANCH exit knobs below are no longer referenced at
+   runtime: the island exit is now owned by island_phase (IS_LEAVE). */
 #define BRANCH_EXIT_MODE 1    /* 0 centred only; 1 any line + dwell; 2 + yaw; 3 + distance */
 #define BRANCH_MIN_MS 100u    /* minimum dwell in BRANCH before an exit is allowed */
 #define BRANCH_MIN_YAW 0.50f  /* rad of heading change for BRANCH_EXIT_MODE 2 */
 #define BRANCH_MIN_DIST 0.15f /* metres travelled for BRANCH_EXIT_MODE 3 */
 #define CROSS_TIMEOUT_MS 450u
-#define BRANCH_TIMEOUT_MS 550u
+#define BRANCH_TIMEOUT_MS 1500u /* must exceed ARMED+TURN_IN+LOOP+TURN_OUT+LEAVE */
 #define SEARCH_TIMEOUT_MS 1100u
-#define BRANCH_NUDGE_MS 200u
+#define BRANCH_NUDGE_MS 100u
+/* ---- Island sub-state machine ---- */
+#define ISLAND_FORCE_SIDE 1    /* 1: lock onto the ISLAND_SIDE segment for the whole island */
+#define ISLAND_OUT_TRIGGER 1   /* 0 time only; 1 second fork->fall; 2 heading; 3 distance */
+#define ISLAND_OUT_YAW 3.00f   /* rad for trigger 2 */
+#define ISLAND_OUT_DIST 0.60f  /* metres for trigger 3 */
+#define ISLAND_OUT_MS 600u     /* hard fallback: leave LOOP after this */
+#define ISLAND_LEAVE_MS 150u   /* straight running before returning to FOLLOW */
+#define ISLAND_OUT_DIR 1       /* +1/-1: final turn direction relative to ISLAND_SIDE */
+/* ---- Active island turn ---- */
+#define BRANCH_TURN_ENABLE 1     /* 0 = PD only, no turn pulses */
+#define BRANCH_TURN_TRIGGER 1    /* 0 immediate; 1 wait for groups to fall to 1; 2 distance */
+#define BRANCH_FALL_FRAMES 2     /* consecutive single-group frames needed by trigger 1 */
+#define BRANCH_WAIT_MAX_MS 250u  /* safety: force the entrance turn if no fall-back */
+#define BRANCH_TURN_DIST 0.08f   /* trigger 2: metres from fork detection to the junction */
+#define BRANCH_TURN_MS 100u      /* duration of each turn pulse */
+#define BRANCH_TURN_W 1.2f       /* extra angular rate added on top of the PD output */
+#define BRANCH_TURN_V 0.15f      /* speed cap during a turn */
+#define BRANCH_TURN_DIR (-1)     /* entrance turn: w += DIR*ISLAND_SIDE*W */
 enum { FOLLOW, CROSS, BRANCH, SEARCH };
+enum { IS_NONE, IS_ARMED, IS_TURN_IN, IS_LOOP, IS_TURN_OUT, IS_LEAVE };
 static int track_state, edge_side, edge_age, fork_frames, clear_frames;
 static int side_flip_frames, track_d_ready, track_bend_ready;
-static unsigned state_ms;
+static int island_phase, island_fall_frames, island_out_armed;
+static unsigned state_ms, island_phase_start;
 static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 
 static void track_enter(int state){
@@ -184,6 +206,8 @@ static void track_enter(int state){
     entry_s=app_s;
     track_d_ready=0;     /* suppress the D term on the first frame back in FOLLOW */
     track_bend_ready=0;  /* suppress a fake dbend jump on the first frame back */
+    island_phase=(state==BRANCH)?IS_ARMED:IS_NONE;
+    island_fall_frames=0;island_out_armed=0;island_phase_start=0;
 }
 static void track_reset(void){
     track_enter(FOLLOW);
@@ -222,22 +246,28 @@ static void track_control(float *v,float *w){
     track_bend_ready=1;
     float severity=BEND_ENABLE?(fabsf(bend)+BEND_RATE_K*fabsf(dbend)):0.0f;
     int wide=(groups==1 && total>=12);
-    /* A fork is two separated lit groups straddling the bar. The old test
-       required them to touch ch0 and ch11 exactly, which is easily missed
-       when the car is off-centre at an island entry. */
+    /* Real island entry: ONE segment probes in from an edge, the other is the
+       original straight line near the middle. Requiring BOTH ends to be near
+       an edge (the old test) can never match that pattern. */
     int fork=0;
     if(groups>=2){
         int last=groups-1;
         int w0=ends[0]-starts[0]+1;
         int wN=ends[last]-starts[last]+1;
         int gap=starts[last]-ends[0]-1;
-        if(FORK_STRICT)
+        int near_left=(starts[0]<=FORK_EDGE_MARGIN);
+        int near_right=(ends[last]>=11-FORK_EDGE_MARGIN);
+        int shape=(gap>=FORK_GAP_MIN && w0>=FORK_SEG_MIN && wN>=FORK_SEG_MIN);
+        /* FORK_MODE kept as a 3-way selector: the real-car one-edge test (1)
+           has NOT been validated on the car yet, so 0/2 stay available for
+           A/B comparison during the island test sequence. */
+        if(FORK_MODE==0)
             fork=(starts[0]==0 && ends[0]>=1 &&
                   ends[last]==11 && starts[last]<=10);
+        else if(FORK_MODE==1)
+            fork=shape && (near_left || near_right);
         else
-            fork=(starts[0]<=FORK_EDGE_MARGIN &&
-                  ends[last]>=11-FORK_EDGE_MARGIN &&
-                  gap>=FORK_GAP_MIN && w0>=FORK_SEG_MIN && wN>=FORK_SEG_MIN);
+            fork=shape;
     }
     int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
                  fabsf(weight)<CENTRAL_WEIGHT_MAX);
@@ -273,8 +303,7 @@ static void track_control(float *v,float *w){
         }else side_flip_frames=0;
         /* Legacy single-frame shortcut. Default OFF: it used to overwrite the
            corner direction and could reverse the turn right before line loss. */
-        if(SIDE_ENABLE==1 && side && !corner && !edge_side){edge_side=side;edge_age=0;}
-        if(SIDE_ENABLE==2 && side){edge_side=side;edge_age=0;}
+        if(SIDE_ENABLE && side && !corner && !edge_side){edge_side=side;edge_age=0;}
         fork_frames=fork ? fork_frames+1 : 0;
         if(wide) track_enter(CROSS);
         else if(fork_frames>=FORK_FRAMES){
@@ -284,6 +313,46 @@ static void track_control(float *v,float *w){
         }else if(!total && edge_age<=24 && edge_side) track_enter(SEARCH);
     }
     if(track_state!=FOLLOW)state_ms+=5;
+    /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
+       and the exit junction, and two-segment patterns reappear during the
+       final turn. A pattern-only exit cannot tell those moments apart. */
+    if(track_state==BRANCH){
+        unsigned ph_ms=state_ms-island_phase_start;
+        if(island_phase==IS_ARMED){
+            int trigger=0;
+            if(BRANCH_TURN_TRIGGER==0)trigger=1;
+            else if(BRANCH_TURN_TRIGGER==1){
+                if(groups==1)island_fall_frames++;
+                else island_fall_frames=0;
+                trigger=(island_fall_frames>=BRANCH_FALL_FRAMES);
+            }else if(BRANCH_TURN_TRIGGER==2)
+                trigger=(app_s-entry_s>=BRANCH_TURN_DIST);
+            if((int)state_ms>=(int)BRANCH_WAIT_MAX_MS)trigger=1;
+            if(trigger){island_phase=IS_TURN_IN;island_phase_start=state_ms;}
+        }else if(island_phase==IS_TURN_IN){
+            if((int)ph_ms>=(int)BRANCH_TURN_MS){island_phase=IS_LOOP;island_phase_start=state_ms;}
+        }else if(island_phase==IS_LOOP){
+            int out=0;
+            if(ISLAND_OUT_TRIGGER==1){
+                if(fork)island_out_armed=1;
+                else if(island_out_armed && groups==1)out=1;
+            }else if(ISLAND_OUT_TRIGGER==2)
+                out=(fabsf(app_yaw-entry_yaw)>=ISLAND_OUT_YAW);
+            else if(ISLAND_OUT_TRIGGER==3)
+                out=((app_s-entry_s)>=ISLAND_OUT_DIST);
+            if((int)ph_ms>=(int)ISLAND_OUT_MS)out=1;
+            if(out){island_phase=IS_TURN_OUT;island_phase_start=state_ms;}
+        }else if(island_phase==IS_TURN_OUT){
+            if((int)ph_ms>=(int)BRANCH_TURN_MS){island_phase=IS_LEAVE;island_phase_start=state_ms;}
+        }else if(island_phase==IS_LEAVE){
+            if((int)ph_ms>=(int)ISLAND_LEAVE_MS){
+                track_enter(FOLLOW);
+                edge_age=100;edge_side=0;
+                if(total)app_error_prev=app_line_prev=(starts[0]+ends[0])/11.0f-1.0f;
+                else app_error_prev=app_line_prev=0;
+            }
+        }
+    }
     if(total || track_state==SEARCH || track_state==CROSS)app_lost=0;
     if(track_state!=FOLLOW){
         /* "Line found" is deliberately looser than "centred": leaving a corner
@@ -295,12 +364,10 @@ static void track_control(float *v,float *w){
             exit_ok=(SEARCH_EXIT_MODE==0)?central:seen;
             if(SEARCH_EXIT_MODE==2)exit_ok=exit_ok && fabsf(weight)<prev_abs;
         }else if(track_state==BRANCH){
-            exit_ok=(BRANCH_EXIT_MODE==0)?central:
-                    (seen && state_ms>=BRANCH_MIN_MS);
-            if(BRANCH_EXIT_MODE==2)
-                exit_ok=exit_ok && fabsf(app_yaw-entry_yaw)>=BRANCH_MIN_YAW;
-            if(BRANCH_EXIT_MODE==3)
-                exit_ok=exit_ok && (app_s-entry_s)>=BRANCH_MIN_DIST;
+            /* The island exit is owned by island_phase (IS_LEAVE), not by a
+               pattern test: two-segment patterns reappear during the final
+               turn and would keep resetting a 'seen'-based counter. */
+            exit_ok=0;
         }else exit_ok=central; /* CROSS keeps the centred test */
         clear_frames=exit_ok ? clear_frames+1 : 0;
         if(clear_frames>=EXIT_FRAMES){
@@ -326,8 +393,9 @@ static void track_control(float *v,float *w){
     }
     if(!total){
         track_d_ready=0; /* next line frame must not differentiate across the gap */
-        if(track_state==BRANCH && state_ms<=BRANCH_NUDGE_MS){
-            *v=0.05f; *w=-ISLAND_SIDE*1.5f; return;
+        if(track_state==BRANCH){
+            int d=(island_phase==IS_TURN_OUT)?ISLAND_OUT_DIR:BRANCH_TURN_DIR;
+            *v=0.05f; *w=d*ISLAND_SIDE*1.5f; return;
         }
         app_motor(0,0);app_cmd_l=app_cmd_r=app_il=app_ir=0;
         app_lost+=5;if(app_lost>=50)app_fail(5);
@@ -340,7 +408,7 @@ static void track_control(float *v,float *w){
         float dist=fabsf((starts[i]+ends[i])/11.0f-1.0f-app_line_prev);
         if(dist<best){pick=i;best=dist;}
     }
-    if(track_state==BRANCH) pick=ISLAND_SIDE<0 ? 0 : groups-1;
+    if(track_state==BRANCH && ISLAND_FORCE_SIDE) pick=ISLAND_SIDE<0 ? 0 : groups-1;
     float e=(starts[pick]+ends[pick])/11.0f-1.0f;
     /* Differentiate only when the previous frame also followed the line:
        after a lost line / state switch a stale e divided by DT would kick w
@@ -365,6 +433,17 @@ static void track_control(float *v,float *w){
     if(track_state==FOLLOW && (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
         *v=fminf(*v,CORNER_SLOW_MPS);
     if(fork || track_state==BRANCH)*v=fminf(*v,0.15f);
+    /* Active steering only in the two turn phases. Both pulses add to the PD
+       output rather than replacing it, so the chosen line is still tracked. */
+    if(track_state==BRANCH && BRANCH_TURN_ENABLE){
+        int dir=0;
+        if(island_phase==IS_TURN_IN)dir=BRANCH_TURN_DIR;
+        else if(island_phase==IS_TURN_OUT)dir=ISLAND_OUT_DIR;
+        if(dir){
+            *w=app_clip(*w+dir*ISLAND_SIDE*BRANCH_TURN_W,-2,2);
+            *v=fminf(*v,BRANCH_TURN_V);
+        }
+    }
 }
 static void app_start(void){
     if(APP_MODE==0 || app_fault)return;
