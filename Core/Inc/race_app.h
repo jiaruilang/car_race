@@ -8,7 +8,8 @@
 #include <stdio.h>
 
 /* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
-   5 four left 90-degree turns; 6 basic line following (NO ring routing). */
+   5 four left 90-degree turns; 6 line following; 7 static steering bench
+   (v=0, spin in place, nudge the car and watch it recover). */
 #define APP_MODE 6
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
@@ -238,6 +239,56 @@ static float steer_line(float e,float dterm,float kp,int valid_previous){
 #else
     return desired;
 #endif
+}
+/* ---- MODE7: static steering test bench ---------------------------------
+   APP_MODE 7 keeps the car in place (v=0) and lets steer_line() alone drive
+   the differential: nudge the body off the line, watch the recovery. The
+   MODE6 state machine, bend slowdown, island logic, SEARCH and the wheel
+   speed floor are all bypassed, so only the steering loop is under test.
+   All three TRACK_STEER_MODE variants are reused unchanged; steer_gyro keeps
+   being updated every tick in app_control(), so the gyro feedback of modes
+   1 and 2 is live while spinning in place.                                */
+#define MODE7_W_LIMIT 2.0f    /* cap on |w| (rad/s); default = steer_line's own clip */
+#define MODE7_KICK_PWM 0.0f  /* 0=off. Optional start-up duty floor for tiny
+                                wheel targets. A PWM floor creates a limit
+                                cycle, so leave it off when judging response. */
+#define MODE7_NO_TIMEOUT 1   /* 1: skip the 120 s run timeout while debugging */
+#define MODE7_NO_STALL 1     /* 1: skip stall fault 8 (car is held by hand) */
+#define MODE7_FF_TURN 1      /* 1: SPEED_FF_TURN_L/R (spin load); 0: straight FF */
+static float steer_test_e_prev;
+static int steer_test_d_ready;
+static void steer_test_control(float *w){
+    int starts[6],ends[6],groups=0,total=0,previous=0;
+    for(int i=0;i<12;i++){
+        int white=MUX_GET_CHANNEL(app_mask,i);
+        if(white){
+            if(!previous)starts[groups++]=i;
+            ends[groups-1]=i;
+            total++;
+        }
+        previous=white;
+    }
+    if(!total){
+        /* The line swept out of the bar while spinning: freeze, do not
+           keep turning on a stale error. Clear the yaw-rate PID memory. */
+        *w=0;
+        steer_test_e_prev=0;steer_test_d_ready=0;
+        rate_i=0;rate_prev=0;rate_ready=0;
+        return;
+    }
+    /* Same normalised centre error as MODE6, so LINE_KP/LINE_KD transfer. */
+    int pick=0;float best=10;
+    for(int i=0;i<groups;i++){
+        float c=(starts[i]+ends[i])/11.0f-1.0f;
+        float d=fabsf(c-steer_test_e_prev);
+        if(d<best){pick=i;best=d;}
+    }
+    float e=(starts[pick]+ends[pick])/11.0f-1.0f;
+    float de=steer_test_d_ready?
+        app_clip((e-steer_test_e_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
+    *w=app_clip(steer_line(e,de,LINE_KP,steer_test_d_ready),
+                -MODE7_W_LIMIT,MODE7_W_LIMIT);
+    steer_test_e_prev=e;steer_test_d_ready=1;
 }
 static void track_enter(int state){
     track_state=state;
@@ -491,7 +542,8 @@ static void app_start(void){
     if(!app_cal_ready || (APP_MODE>=3 && !app_parameters_ok())){app_fail(4);return;}
     app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
     app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
-    track_reset();app_last_completed=app_ms;app_running=1;
+    track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
+    app_last_completed=app_ms;app_running=1;
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
@@ -499,7 +551,9 @@ static void app_control(float gz_rad){
     if(!app_running){app_target_l=0;app_target_r=0;return;}
     app_target_l=0;app_target_r=0;
     app_elapsed+=5;
-    if(app_elapsed>120000u){app_fail(6);return;}
+    if(app_elapsed>120000u && !(MODE7_NO_TIMEOUT && APP_MODE==7)){
+        app_fail(6);return;
+    }
     if(APP_MODE==1 || APP_MODE==2){
         float u=TEST_REVERSE?-TEST_PWM:TEST_PWM;
         if(app_elapsed>=10000u){App_Stop();return;}
@@ -531,6 +585,11 @@ static void app_control(float gz_rad){
     }else if(APP_MODE==6){
         track_control(&v,&w);
         if(!app_running || app_lost)return;
+    }else if(APP_MODE==7){
+        /* Static bench: no forward speed, w comes only from the steering
+           loop; tl/tr below become a pure spin-in-place differential. */
+        v=0;
+        steer_test_control(&w);
     }
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
     /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
@@ -552,20 +611,31 @@ static void app_control(float gz_rad){
         if(fabsf(tl)<0.5f*MIN_SPEED_MPS){tl=0;app_il=0;}
         if(fabsf(tr)<0.5f*MIN_SPEED_MPS){tr=0;app_ir=0;}
     }    app_target_l=tl;app_target_r=tr;
-    float ffl=(APP_MODE==5 || (APP_MODE==6 && track_state==SEARCH))?SPEED_FF_TURN_L:SPEED_FF_L;
-    float ffr=(APP_MODE==5 || (APP_MODE==6 && track_state==SEARCH))?SPEED_FF_TURN_R:SPEED_FF_R;
+    int ff_turn=(APP_MODE==5 || (MODE7_FF_TURN && APP_MODE==7) ||
+                 (APP_MODE==6 && track_state==SEARCH));
+    float ffl=ff_turn?SPEED_FF_TURN_L:SPEED_FF_L;
+    float ffr=ff_turn?SPEED_FF_TURN_R:SPEED_FF_R;
     app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,ffl);
     app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,ffr);
+    /* MODE7 only: optional duty floor so a tiny target can break static
+       friction. OFF by default - a PWM floor creates a limit cycle that
+       hides the real steering response. */
+    if(APP_MODE==7 && MODE7_KICK_PWM>0.0f){
+        if(app_target_l!=0.0f)
+            app_cmd_l=copysignf(fmaxf(fabsf(app_cmd_l),MODE7_KICK_PWM),app_target_l);
+        if(app_target_r!=0.0f)
+            app_cmd_r=copysignf(fmaxf(fabsf(app_cmd_r),MODE7_KICK_PWM),app_target_r);
+    }
     /* Sustained high effort with no motion: stop instead of heating a motor. */
     if((fabsf(app_cmd_l)>MAX_PWM*0.9f && fabsf(app_vl)<0.003f)||
        (fabsf(app_cmd_r)>MAX_PWM*0.9f && fabsf(app_vr)<0.003f))app_stall+=5;
     else app_stall=0;
-    if(app_stall>=800u){app_fail(8);return;}
+    if(app_stall>=800u && !(MODE7_NO_STALL && APP_MODE==7)){app_fail(8);return;}
     app_motor(app_cmd_l,app_cmd_r);
 }
 static void App_Init(void){
     App_Stop();
-    if(APP_MODE<0 || APP_MODE>6 || MAX_PWM<=0 || MAX_PWM>0.85f ||
+    if(APP_MODE<0 || APP_MODE>7 || MAX_PWM<=0 || MAX_PWM>0.85f ||
        TEST_PWM<=0 || TEST_PWM>0.15f){app_fail(4);return;}
     CoreDebug->DEMCR|=CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL|=DWT_CTRL_CYCCNTENA_Msk;
