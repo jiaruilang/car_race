@@ -31,7 +31,7 @@
 #define MAX_PWM 0.30f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.350f
+#define TEST_SPEED_MPS 0.45f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.0f       /* initial trial only; error range -1..1 */
@@ -142,7 +142,7 @@ static int app_parameters_ok(void){
 #define CORNER_WEIGHT_MIN 2.5f  /* |weighted sum| above this => one side dominates */
 #define CORNER_DWEIGHT_MIN 1.5f /* jump in weighted sum from last frame => shape change */
 #define CORNER_FRAMES 2         /* opposite-sign frames needed to flip a latched direction */
-#define CORNER_SLOW_MPS 0.20f   /* cruise cap while a corner is being approached */
+#define CORNER_SLOW_MPS 0.30f   /* cruise cap while a corner is being approached */
 #define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 /* ---- Fork / island entry ---- */
 #define FORK_MODE 1           /* 0 legacy both ends; 1 one edge segment + another (real car); 2 any two groups */
@@ -173,9 +173,17 @@ static int app_parameters_ok(void){
 #define BEND_DBEND_MAX 1.0f   /* clamp on a single-frame bend change */
 /* B-tier strategies: both OFF by default, switch on independently. */
 #define BEND_KP_ENABLE 1      /* B-tier 1: gain scheduling */
-#define BEND_KP_K 0.2f        /* strength used when BEND_KP_ENABLE is 1 */
+#define BEND_KP_K 0.4f        /* strength used when BEND_KP_ENABLE is 1 */
 #define BEND_D_USE_DBEND 0    /* B-tier 2: use dbend instead of de as the D input */
 #define BEND_D_SCALE 200.0f   /* align dbend (per frame) with de (per second) */
+/* BEND_KP_ENABLE can keep severity high on a straight (small oscillation ->
+   dbend -> severity -> bigger kp -> more oscillation), so the car never
+   "returns to line". After a continuous centred line for this long, drop the
+   bend/corner speed caps AND restore kp to LINE_KP (cancel the B1 boost).
+   TRACK_CRUISE/(1+|w|) still decides the speed. 0 = off. */
+#define BEND_STRAIGHT_RELEASE 1
+#define BEND_STRAIGHT_MS 500u
+#define BEND_STRAIGHT_E 0.35f
 /* ---- Direction latching ---- */
 #define SIDE_ENABLE 1         /* fixed: fallback only; modes 0 (off) and 2 (override) removed */
 #define EDGE_LATCH 1          /* 1: hold a latched side until the window dies or SEARCH exits */
@@ -235,6 +243,8 @@ static unsigned state_ms, island_phase_start;
    once per tick so the state trace shows why a transition fired. */
 static int dbg_groups, dbg_total, dbg_fork, dbg_corner, dbg_island_pair;
 static int fork_hold_tail, fork_release; /* sticky pre-island steering hold */
+static unsigned straight_ms; /* continuous centred-line time (ms) */
+static long dbg_kp_gain; /* kp*100, refreshed on line-following frames only */
 static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 
 /* 1: line PD -> yaw-rate PID -> wheel PI
@@ -421,6 +431,16 @@ static void track_control(float *v,float *w){
     /* Publish before every early return below, so all control paths in
        this tick report the same fresh pattern snapshot to app_log(). */
     dbg_groups=groups;dbg_total=total;dbg_fork=fork;dbg_corner=corner;
+    /* Straight detector uses bend (the width-free line centre), NOT severity:
+       with BEND_KP on, severity can stay artificially high on a straight,
+       which is exactly the loop we want to break. */
+    if(BEND_STRAIGHT_RELEASE){
+        int straight_like=(groups==1 && total>0 &&
+            total<=CENTRAL_TOTAL_MAX && fabsf(bend)<BEND_STRAIGHT_E);
+        if(straight_like && track_state==FOLLOW){
+            if(straight_ms<BEND_STRAIGHT_MS+5u)straight_ms+=5;
+        }else straight_ms=0;
+    }else straight_ms=0;
     int corner_side=(fabsf(weight)>0.01f)?(weight>0.0f?1:-1):
                     (right_hits>=left_hits?1:-1);
     int side=0;
@@ -625,19 +645,30 @@ static void track_control(float *v,float *w){
     float dterm=(in_window||fork_release>0||entry_slew)?0.0f:
         ((BEND_ENABLE && BEND_D_USE_DBEND)?
             app_clip(dbend*BEND_D_SCALE,-LINE_D_MAX,LINE_D_MAX):de);
+    /* One flag for both effects: after a confirmed straight, cancel the
+       severity slowdowns AND restore the B1 gain boost to LINE_KP. */
+    int straight_release=(BEND_STRAIGHT_RELEASE && track_state==FOLLOW &&
+                          (int)straight_ms>=(int)BEND_STRAIGHT_MS);
     float kp=LINE_KP;
-    /* B-tier option 1: gain scheduling, inert while BEND_KP_ENABLE is 0. */
-    if(BEND_ENABLE && BEND_KP_ENABLE)kp*=1.0f+BEND_KP_K*severity;
+    /* B-tier option 1: gain scheduling; suppressed while released so BEND_KP
+       cannot sustain its own severity loop on a straight. */
+    if(BEND_ENABLE && BEND_KP_ENABLE && !straight_release)
+        kp*=1.0f+BEND_KP_K*severity;
+    dbg_kp_gain=(long)(kp*100.0f);
     *w=steer_line(e,dterm,kp,track_d_ready);
     app_error_prev=app_line_prev=e;track_d_ready=1;
+    /* straight_release also cancels the bend and corner slowdowns below.
+       The w-based cap and the fork/BRANCH 0.15 cap stay, so steering and
+       island behaviour are untouched. */
     *v=TRACK_CRUISE/(1+fabsf(*w));
     /* Graded slowdown: every bend reduces v, not just a right-angle corner.
        The old binary cap remains as the extreme end of the same scale. */
-    if(BEND_ENABLE && BEND_SLOW_K>0.0f)
+    if(BEND_ENABLE && BEND_SLOW_K>0.0f && !straight_release)
         *v=fminf(*v,TRACK_CRUISE/(1.0f+BEND_SLOW_K*severity));
     /* Corner approach: cap speed by how far the lit pattern has shifted, but
        keep the PD steering instead of overriding w with a fixed bang-bang. */
-    if(track_state==FOLLOW && (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
+    if(track_state==FOLLOW && !straight_release &&
+       (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
         *v=fminf(*v,CORNER_SLOW_MPS);
     if(fork || track_state==BRANCH)*v=fminf(*v,0.15f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
@@ -807,10 +838,11 @@ static void app_log(void){
                T state_ms, G groups, tot lit sensors, fk fork, cn corner,
                ff fork_frames, oa island_out_armed, fl island_fall_frames,
                cf clear_frames, ph ms elapsed in current island phase,
-               ip island_pair (1 = narrow island probe, 0 = corner/other). */
+               ip island_pair (1 = narrow island probe, 0 = corner/other),
+               sm continuous centred-line ms. */
             n=snprintf(app_tx,sizeof(app_tx),
               "M%d run%u F%u cal%u key%u L%ld R%ld vL%ld vR%ld s%ld a%ld z%ld q%03X uL%ld uR%ld"
-              " | S%d P%d T%lu G%d tot%d fk%d cn%d ff%d oa%d fl%d cf%d ph%lu ip%d\r\n",
+              " | S%d P%d T%lu G%d tot%d fk%d cn%d ff%d oa%d fl%d cf%d ph%lu ip%d sm%lu kg%ld\r\n",
               APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable,
               (long)app_counts_l,(long)app_counts_r,(long)(app_vl*1000),
               (long)(app_vr*1000),(long)(app_s*1000),(long)(app_yaw*1800/PI_F),
@@ -819,7 +851,8 @@ static void app_log(void){
               track_state,island_phase,(unsigned long)state_ms,dbg_groups,
               dbg_total,dbg_fork,dbg_corner,fork_frames,island_out_armed,
               island_fall_frames,clear_frames,
-              (unsigned long)(state_ms-island_phase_start),dbg_island_pair);
+              (unsigned long)(state_ms-island_phase_start),dbg_island_pair,
+              (unsigned long)straight_ms,dbg_kp_gain);
         }
         app_tx_len=n>0?(unsigned)n:0;
         if(app_tx_len>=sizeof(app_tx))app_tx_len=sizeof(app_tx)-1;
