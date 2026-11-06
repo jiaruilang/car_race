@@ -198,6 +198,47 @@ static int island_phase, island_fall_frames, island_out_armed;
 static unsigned state_ms, island_phase_start;
 static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 
+/* 1: line PD -> yaw-rate PID -> wheel PI
+   2: nonlinear line PD + gyro damping -> wheel PI
+   3: existing line PD -> wheel PI */
+#ifndef TRACK_STEER_MODE
+#define TRACK_STEER_MODE 3
+#endif
+#if TRACK_STEER_MODE < 1 || TRACK_STEER_MODE > 3
+#error Invalid TRACK_STEER_MODE
+#endif
+#define STEER2_KP2 0.0f
+#define STEER2_GYRO_KD 0.0f
+#define RATE_KP 0.30f
+#define RATE_KI 0.0f
+#define RATE_KD 0.0f
+#define RATE_GYRO_TAU 0.020f
+#define RATE_I_LIMIT 0.5f
+static float steer_gyro, rate_i, rate_prev;
+static int rate_ready;
+static void steer_reset(void){
+    rate_i=0;rate_prev=0;rate_ready=0;steer_gyro=0;
+}
+static float steer_line(float e,float dterm,float kp,int valid_previous){
+    float desired=app_clip(-(kp*e+LINE_KD*dterm),-2.0f,2.0f);
+#if TRACK_STEER_MODE == 1
+    if(!valid_previous){rate_i=0;rate_ready=0;}
+    float error=desired-steer_gyro;
+    float derivative=rate_ready?-(steer_gyro-rate_prev)/DT:0;
+    rate_prev=steer_gyro;rate_ready=1;
+    float next=app_clip(rate_i+RATE_KI*error*DT,-RATE_I_LIMIT,RATE_I_LIMIT);
+    /* desired is a nominal kinematic feedforward; PID corrects rate error. */
+    float raw=desired+RATE_KP*error+next+RATE_KD*derivative;
+    float output=app_clip(raw,-2.0f,2.0f);
+    if(raw==output || (raw>output && error<0) || (raw<output && error>0))rate_i=next;
+    return output;
+#elif TRACK_STEER_MODE == 2
+    return app_clip(-(kp*e+LINE_KD*dterm+STEER2_KP2*e*fabsf(e))
+                    -STEER2_GYRO_KD*steer_gyro,-2.0f,2.0f);
+#else
+    return desired;
+#endif
+}
 static void track_enter(int state){
     track_state=state;
     state_ms=0;
@@ -209,7 +250,7 @@ static void track_enter(int state){
     island_phase=(state==BRANCH)?IS_ARMED:IS_NONE;
     island_fall_frames=0;island_out_armed=0;island_phase_start=0;
 }
-static void track_reset(void){
+static void track_reset(void){ steer_reset();
     track_enter(FOLLOW);
     edge_side=0; edge_age=100; fork_frames=0;
     side_flip_frames=0; track_weight_prev=0;
@@ -421,7 +462,7 @@ static void track_control(float *v,float *w){
     float kp=LINE_KP;
     /* B-tier option 1: gain scheduling, inert while BEND_KP_ENABLE is 0. */
     if(BEND_ENABLE && BEND_KP_ENABLE)kp*=1.0f+BEND_KP_K*severity;
-    *w=app_clip(-(kp*e+LINE_KD*dterm),-2,2);
+    *w=steer_line(e,dterm,kp,track_d_ready);
     app_error_prev=app_line_prev=e;track_d_ready=1;
     *v=TRACK_CRUISE/(1+fabsf(*w));
     /* Graded slowdown: every bend reduces v, not just a right-angle corner.
@@ -466,6 +507,7 @@ static void app_control(float gz_rad){
         app_motor(app_cmd_l,app_cmd_r);return;
     }
     app_yaw+=gz_rad*DT;
+    steer_gyro += (DT/(RATE_GYRO_TAU+DT))*(gz_rad-steer_gyro);
     if(APP_MODE==3){
         v=TEST_SPEED_MPS;
         if(app_elapsed>=10000u){App_Stop();return;}
