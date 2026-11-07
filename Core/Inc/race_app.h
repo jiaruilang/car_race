@@ -10,7 +10,7 @@
 /* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
    5 four left 90-degree turns; 6 line following; 7 static steering bench
    (v=0, spin in place, nudge the car and watch it recover). */
-#define APP_MODE 6
+#define APP_MODE 7
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
 #define RIGHT_FORWARD_HIGH 0
@@ -34,7 +34,7 @@
 #define TEST_SPEED_MPS 0.45f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
-#define LINE_KP 2.0f       /* initial trial only; error range -1..1 */
+#define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.02f
 #define LINE_D_MAX 20.0f  /* clamp on de/dt so a stale error cannot kick the D term */
 #define HEADING_KP 2.0f   /* MODE4 only */
@@ -42,6 +42,9 @@
 #define TURN_MAX_RAD_S 4.0f
 #define TURN_TOL_RAD 0.025f  /* angle window for a completed quarter turn; also releases the speed floor */
 #define MIN_SPEED_FLOOR_MODE6 1 /* 1: apply the wheel-speed floor in MODE6 too; 0: line mode exempt */
+#define MODE7_CRUISE_MPS 0.16f /* 0=off (pure spin in place). Forward bias
+                                  during MODE7 recovery, and the hard floor
+                                  on BOTH |tl|,|tr|; never below 0.15. */
 #define DISTANCE_KP 1.5f
 #define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
@@ -54,7 +57,7 @@
 #endif
 #define DT 0.005f
 #define PI_F 3.14159265358979f /* TRUE pi: physical dps->rad/s and log conversion ONLY */
-#define TURN_STEP_RAD (PI_F*0.5f) /* MODE5: target yaw per quarter; tune here for angle bias */
+#define TURN_STEP_RAD (PI_F*0.5f*1.01) /* MODE5: target yaw per quarter; tune here for angle bias */
 #define TRACK_HEADING_KP 2.0f /* MODE6 CROSS: own heading-hold gain, independent of MODE4 */
 
 extern struct bmi2_dev bmi270; /* defined in the official dodo_BMI270.c */
@@ -131,7 +134,9 @@ static int app_parameters_ok(void){
       SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
       MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
       MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
-      TURN_TOL_RAD>0 && TURN_STEP_RAD>0 && TRACK_HEADING_KP>0 && LINE_D_MAX>0;
+      TURN_TOL_RAD>0 && TURN_STEP_RAD>0 && TRACK_HEADING_KP>0 && LINE_D_MAX>0 &&
+      (MODE7_CRUISE_MPS==0.0f ||
+       (MODE7_CRUISE_MPS>=0.15f && MODE7_CRUISE_MPS<=TEST_SPEED_MPS));
 }
 /* MODE6 trial settings. Channels 0..11 run from left to right. */
 #define TRACK_CRUISE TEST_SPEED_MPS
@@ -181,7 +186,7 @@ static int app_parameters_ok(void){
 #define BEND_SEARCH_MIN 0.80f /* severity above this opens the SEARCH window */
 #define BEND_DBEND_MAX 1.0f   /* clamp on a single-frame bend change */
 /* B-tier strategies: both OFF by default, switch on independently. */
-#define BEND_KP_ENABLE 1      /* B-tier 1: gain scheduling */
+#define BEND_KP_ENABLE 0      /* B-tier 1: gain scheduling */
 #define BEND_KP_K 0.4f        /* strength used when BEND_KP_ENABLE is 1 */
 #define BEND_D_USE_DBEND 0    /* B-tier 2: use dbend instead of de as the D input */
 #define BEND_D_SCALE 200.0f   /* align dbend (per frame) with de (per second) */
@@ -274,13 +279,13 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
    2: nonlinear line PD + gyro damping -> wheel PI
    3: existing line PD -> wheel PI */
 #ifndef TRACK_STEER_MODE
-#define TRACK_STEER_MODE 3
+#define TRACK_STEER_MODE 2
 #endif
 #if TRACK_STEER_MODE < 1 || TRACK_STEER_MODE > 3
 #error Invalid TRACK_STEER_MODE
 #endif
-#define STEER2_KP2 0.0f
-#define STEER2_GYRO_KD 0.0f
+#define STEER2_KP2 0.10f
+#define STEER2_GYRO_KD 0.04f
 #define RATE_KP 0.30f
 #define RATE_KI 0.0f
 #define RATE_KD 0.0f
@@ -311,24 +316,38 @@ static float steer_line(float e,float dterm,float kp,int valid_previous){
     return desired;
 #endif
 }
-/* ---- MODE7: static steering test bench ---------------------------------
-   APP_MODE 7 keeps the car in place (v=0) and lets steer_line() alone drive
-   the differential: nudge the body off the line, watch the recovery. The
-   MODE6 state machine, bend slowdown, island logic, SEARCH and the wheel
-   speed floor are all bypassed, so only the steering loop is under test.
+/* ---- MODE7: steering test bench ----------------------------------------
+   APP_MODE 7 isolates the steering loop: nudge the body off the line and
+   watch the recovery. The MODE6 state machine, bend slowdown, island logic,
+   SEARCH and the MODE6 wheel speed floor are all bypassed.
+   The car sits still with the motors OFF until |e| exceeds TRIGGER_E; then a
+   short correction run opens, with a common forward bias (MODE7_CRUISE_MPS)
+   keeping both wheels above the speed floor so the differential is a small
+   perturbation on already-moving wheels instead of a deadzone start. The run
+   ends once the line is centred for SETTLE_MS (or after ACTIVE_MAX_MS), and
+   the motors are cut again - so w->0 means STOP, not a minimum turn rate.
    All three TRACK_STEER_MODE variants are reused unchanged; steer_gyro keeps
    being updated every tick in app_control(), so the gyro feedback of modes
-   1 and 2 is live while spinning in place.                                */
+   1 and 2 is live.                                                        */
 #define MODE7_W_LIMIT 2.0f    /* cap on |w| (rad/s); default = steer_line's own clip */
+/* MODE7_CRUISE_MPS is defined near the top of the file so
+   app_parameters_ok() can validate it; applied in app_control(). */
 #define MODE7_KICK_PWM 0.0f  /* 0=off. Optional start-up duty floor for tiny
                                 wheel targets. A PWM floor creates a limit
                                 cycle, so leave it off when judging response. */
 #define MODE7_NO_TIMEOUT 1   /* 1: skip the 120 s run timeout while debugging */
 #define MODE7_NO_STALL 1     /* 1: skip stall fault 8 (car is held by hand) */
 #define MODE7_FF_TURN 1      /* 1: SPEED_FF_TURN_L/R (spin load); 0: straight FF */
+/* Sit still with the motors off by default; open a short correction run only
+   when the line is off centre. Hysteresis keeps it from chattering. */
+#define MODE7_TRIGGER_E 0.02f     /* |e| above this starts a correction run */
+#define MODE7_SETTLE_E  0.01f     /* |e| below this for SETTLE_MS ends it */
+#define MODE7_SETTLE_MS 200u      /* ms of centred line before stopping */
+#define MODE7_ACTIVE_MAX_MS 2000u /* hard cap on one run, so the car cannot roll away */
 static float steer_test_e_prev;
 static int steer_test_d_ready;
-static void steer_test_control(float *w){
+static unsigned mode7_active, mode7_steady_ms, mode7_run_ms;
+static void steer_test_control(float *w,float *e_out){
     int starts[6],ends[6],groups=0,total=0,previous=0;
     for(int i=0;i<12;i++){
         int white=MUX_GET_CHANNEL(app_mask,i);
@@ -340,9 +359,9 @@ static void steer_test_control(float *w){
         previous=white;
     }
     if(!total){
-        /* The line swept out of the bar while spinning: freeze, do not
-           keep turning on a stale error. Clear the yaw-rate PID memory. */
-        *w=0;
+        /* The line swept out of the bar: freeze, do not keep turning on a
+           stale error, and do not open a correction run from a lost line. */
+        *w=0;*e_out=0.0f;
         steer_test_e_prev=0;steer_test_d_ready=0;
         rate_i=0;rate_prev=0;rate_ready=0;
         return;
@@ -355,6 +374,7 @@ static void steer_test_control(float *w){
         if(d<best){pick=i;best=d;}
     }
     float e=(starts[pick]+ends[pick])/11.0f-1.0f;
+    *e_out=e;
     float de=steer_test_d_ready?
         app_clip((e-steer_test_e_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
     *w=app_clip(steer_line(e,de,LINE_KP,steer_test_d_ready),
@@ -800,6 +820,7 @@ static void app_start(void){
     app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
     app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
     track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
+    mode7_active=0;mode7_steady_ms=0;mode7_run_ms=0;
     app_last_completed=app_ms;app_running=1;
 }
 static void app_control(float gz_rad){
@@ -843,10 +864,28 @@ static void app_control(float gz_rad){
         track_control(&v,&w);
         if(!app_running || app_lost)return;
     }else if(APP_MODE==7){
-        /* Static bench: no forward speed, w comes only from the steering
-           loop; tl/tr below become a pure spin-in-place differential. */
-        v=0;
-        steer_test_control(&w);
+        float e7;
+        steer_test_control(&w,&e7);
+        if(!mode7_active && fabsf(e7)>MODE7_TRIGGER_E){
+            mode7_active=1;mode7_steady_ms=0;mode7_run_ms=0;
+        }else if(mode7_active){
+            mode7_run_ms+=5;
+            if(fabsf(e7)<MODE7_SETTLE_E){
+                mode7_steady_ms+=5;
+                if(mode7_steady_ms>=MODE7_SETTLE_MS){mode7_active=0;mode7_steady_ms=0;}
+            }else mode7_steady_ms=0;
+            if(mode7_run_ms>=MODE7_ACTIVE_MAX_MS){mode7_active=0;mode7_run_ms=0;}
+        }
+        if(!mode7_active){
+            app_motor(0,0);app_il=app_ir=0;app_cmd_l=app_cmd_r=0;
+            app_target_l=app_target_r=0;
+            return;
+        }
+        /* A common forward bias puts both wheels above the speed floor and
+           lets the differential ride on already-moving wheels. v grows with
+           |w| so the INNER wheel also stays >= MODE7_CRUISE_MPS. */
+        v=MODE7_CRUISE_MPS>0.0f?
+          MODE7_CRUISE_MPS+fabsf(w)*EFFECTIVE_TRACK_M*0.5f:0.0f;
     }
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
     /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
@@ -867,7 +906,8 @@ static void app_control(float gz_rad){
         }
         if(fabsf(tl)<0.5f*MIN_SPEED_MPS){tl=0;app_il=0;}
         if(fabsf(tr)<0.5f*MIN_SPEED_MPS){tr=0;app_ir=0;}
-    }    app_target_l=tl;app_target_r=tr;
+    }
+    app_target_l=tl;app_target_r=tr;
     int ff_turn=(APP_MODE==5 || (MODE7_FF_TURN && APP_MODE==7) ||
                  (APP_MODE==6 && track_state==SEARCH));
     float ffl=ff_turn?SPEED_FF_TURN_L:SPEED_FF_L;
@@ -945,27 +985,46 @@ static void app_log(void){
               (long)(app_cmd_r*1000));
 #endif
         }else{
-            /* Text mode: full state dump. S track_state, P island_phase,
-               T state_ms, G groups, tot lit sensors, fk fork, cn corner,
-               ff fork_frames, oa island_out_armed, fl island_fall_frames,
-               cf clear_frames, ph ms elapsed in current island phase,
-               ip island_pair (1 = narrow island probe, 0 = corner/other),
-               sm continuous centred-line ms, tw two-segment wait,
-               tf consecutive two-segment frames. */
-            n=snprintf(app_tx,sizeof(app_tx),
-              "M%d run%u F%u cal%u key%u L%ld R%ld vL%ld vR%ld s%ld a%ld z%ld q%03X uL%ld uR%ld"
-              " | S%d P%d T%lu G%d tot%d fk%d cn%d ff%d oa%d fl%d tw%d tf%d cf%d ph%lu ip%d sm%lu kg%ld ol%d\r\n",
-              APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable,
-              (long)app_counts_l,(long)app_counts_r,(long)(app_vl*1000),
-              (long)(app_vr*1000),(long)(app_s*1000),(long)(app_yaw*1800/PI_F),
-              (long)(app_gz*10),(unsigned)app_mask,
-              (long)(app_cmd_l*1000),(long)(app_cmd_r*1000),
-              track_state,island_phase,(unsigned long)state_ms,dbg_groups,
-              dbg_total,dbg_fork,dbg_corner,fork_frames,island_out_armed,
-              island_fall_frames,island_two_wait,island_two_frames,
-              clear_frames,
-              (unsigned long)(state_ms-island_phase_start),dbg_island_pair,
-              (unsigned long)straight_ms,dbg_kp_gain,dbg_one_lit);
+            /* One short group per 200 ms; groups are sampled separately.
+               Each group repeats every 1 second. UART transmission remains
+               nonblocking and APP_SCOPE=1 keeps its original format. */
+            static unsigned text_group;
+            switch(text_group){
+            case 0:
+                n=snprintf(app_tx,sizeof(app_tx),
+                    "A M%d run%u F%u cal%u key%u\r\n",
+                    APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable);
+                break;
+            case 1:
+                n=snprintf(app_tx,sizeof(app_tx),
+                    "B L%ld R%ld vL%ld vR%ld uL%ld uR%ld\r\n",
+                    (long)app_counts_l,(long)app_counts_r,
+                    (long)(app_vl*1000),(long)(app_vr*1000),
+                    (long)(app_cmd_l*1000),(long)(app_cmd_r*1000));
+                break;
+            case 2:
+                n=snprintf(app_tx,sizeof(app_tx),
+                    "C s%ld a%ld z%ld q%03X S%d P%d T%lu\r\n",
+                    (long)(app_s*1000),(long)(app_yaw*1800/PI_F),
+                    (long)(app_gz*10),(unsigned)app_mask,
+                    track_state,island_phase,(unsigned long)state_ms);
+                break;
+            case 3:
+                n=snprintf(app_tx,sizeof(app_tx),
+                    "D G%d tot%d fk%d cn%d ff%d oa%d fl%d\r\n",
+                    dbg_groups,dbg_total,dbg_fork,dbg_corner,
+                    fork_frames,island_out_armed,island_fall_frames);
+                break;
+            default:
+                n=snprintf(app_tx,sizeof(app_tx),
+                    "E tw%d tf%d cf%d ph%lu ip%d sm%lu kg%ld ol%d\r\n",
+                    island_two_wait,island_two_frames,clear_frames,
+                    (unsigned long)(state_ms-island_phase_start),
+                    dbg_island_pair,(unsigned long)straight_ms,
+                    dbg_kp_gain,dbg_one_lit);
+                break;
+            }
+            text_group=(text_group+1u)%5u;
         }
         app_tx_len=n>0?(unsigned)n:0;
         if(app_tx_len>=sizeof(app_tx))app_tx_len=sizeof(app_tx)-1;
