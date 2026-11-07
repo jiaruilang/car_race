@@ -164,6 +164,15 @@ static int app_parameters_ok(void){
 #define FORK_HOLD_SEG_MAX 3
 #define FORK_HOLD_TAIL 20u      /* 100 ms sticky window after the last narrow pair */
 #define FORK_HOLD_RELEASE 20u   /* 100 ms smooth release with FORK_E_SLEW */
+/* Sharp-corner veto: a corner lights 5+ sensors on ONE HALF of the bar
+   (ch0-5 or ch6-11), while an island probe is only 2-3 at one edge.
+   When this fires fork is suppressed, so the corner keeps its normal PD
+   response and is never steered into the island state machine. 0 = off. */
+#define FORK_CORNER_LIT_MIN 6
+/* A one-sensor island probe cannot meet FORK_HOLD_SEG_MIN, so the sticky
+   window never opens on the very first frame the pattern appears. Hold e
+   for THAT frame only (5 ms) instead of opening a 100 ms window. 0 = off. */
+#define FORK_HOLD_ONE_LIT 1
 /* ---- Continuous bend handling: weight/total is the line centre, dbend is its
        per-frame change (width-free), severity drives a graded slowdown. ---- */
 #define BEND_ENABLE 1          /* 0 = fall back to the old weight-only corner test */
@@ -220,12 +229,23 @@ static int app_parameters_ok(void){
 #define BRANCH_TURN_ENABLE 1     /* 0 = PD only, no turn pulses */
 #define BRANCH_TURN_TRIGGER 1    /* 0 immediate; 1 wait for groups to fall to 1; 2 distance */
 #define BRANCH_FALL_FRAMES 4     /* consecutive single-group frames needed by trigger 1 */
-#define BRANCH_WAIT_MAX_MS 250u  /* safety: force the entrance turn if no fall-back */
+#define BRANCH_WAIT_MAX_MS 2000u /* safety: force the entrance turn if no fall-back */
 #define BRANCH_TURN_DIST 0.08f   /* trigger 2: metres from fork detection to the junction */
 #define BRANCH_TURN_MS 100u      /* duration of each turn pulse */
 #define BRANCH_TURN_W 1.2f       /* extra angular rate added on top of the PD output */
 #define BRANCH_TURN_V 0.20f      /* speed cap during a turn */
 #define BRANCH_TURN_DIR (-1)     /* entrance turn: w += DIR*ISLAND_SIDE*W */
+/* ---- Wait for the two-segment pattern to come back before turning in ----
+   The 2->1 fall-back at the entrance is the 0..9 junction fill (ONE wide
+   band), not the island branch. IS_TURN_IN re-enables D and follows that
+   band's centre, whose edges flicker frame to frame -> the head twitch.
+   With this on, IS_ARMED keeps its e slew + dterm=0 while the band is
+   present; the entrance turn starts only once groups>=2 reappears, and the
+   pick is then locked onto the LEFT (ISLAND_SIDE) segment.
+   0 = old behaviour (turn as soon as the fall-back is counted). */
+#define BRANCH_ARM_WAIT_TWO 1
+#define BRANCH_TWO_FRAMES 2      /* consecutive 2-segment frames to accept the split */
+#define BRANCH_TWO_MAX_MS 400u   /* after the fall-back, turn anyway if no split */
 /* ---- Exit turn: smaller than the entrance pulse, and follow the RIGHT
        segment of the two-segment pattern while leaving the island. ---- */
 #define ISLAND_TURN_OUT_W 0.6f   /* exit pulse rate; entrance uses BRANCH_TURN_W 1.2 */
@@ -238,10 +258,13 @@ enum { IS_NONE, IS_ARMED, IS_TURN_IN, IS_LOOP, IS_TURN_OUT, IS_LEAVE };
 static int track_state, edge_side, edge_age, fork_frames, clear_frames;
 static int side_flip_frames, track_d_ready, track_bend_ready;
 static int island_phase, island_fall_frames, island_out_armed;
+static int island_fell, island_two_wait, island_two_frames, island_two_ok;
+static unsigned island_fall_ms;
 static unsigned state_ms, island_phase_start;
 /* app_log() cannot see track_control()'s locals; publish pattern flags
    once per tick so the state trace shows why a transition fired. */
 static int dbg_groups, dbg_total, dbg_fork, dbg_corner, dbg_island_pair;
+static int dbg_one_lit; /* single-lit island probe seen this tick */
 static int fork_hold_tail, fork_release; /* sticky pre-island steering hold */
 static unsigned straight_ms; /* continuous centred-line time (ms) */
 static long dbg_kp_gain; /* kp*100, refreshed on line-following frames only */
@@ -348,6 +371,8 @@ static void track_enter(int state){
     track_bend_ready=0;  /* suppress a fake dbend jump on the first frame back */
     island_phase=(state==BRANCH)?IS_ARMED:IS_NONE;
     island_fall_frames=0;island_out_armed=0;island_phase_start=0;
+    island_fell=0;island_two_wait=0;island_two_frames=0;
+    island_two_ok=0;island_fall_ms=0;
 }
 static void track_reset(void){ steer_reset();
     track_enter(FOLLOW);
@@ -389,7 +414,7 @@ static void track_control(float *v,float *w){
     /* Real island entry: ONE segment probes in from an edge, the other is the
        original straight line near the middle. Requiring BOTH ends to be near
        an edge (the old test) can never match that pattern. */
-    int fork=0, island_pair=0;
+    int fork=0, island_pair=0, one_lit_probe=0;
     if(groups>=2){
         int last=groups-1;
         int w0=ends[0]-starts[0]+1;
@@ -398,6 +423,15 @@ static void track_control(float *v,float *w){
         int near_left=(starts[0]<=FORK_EDGE_MARGIN);
         int near_right=(ends[last]>=11-FORK_EDGE_MARGIN);
         int shape=(gap>=FORK_GAP_MIN && w0>=FORK_SEG_MIN && wN>=FORK_SEG_MIN);
+        /* Structural sharp-corner test: 5+ lit sensors on ONE HALF of the
+           bar (ch0-5 or ch6-11). An island entry is two narrow runs, so a
+           wide CENTRAL straight segment (grey band, up to 9 lit) never
+           reaches 5 on one half and is deliberately NOT vetoed. */
+        int corner_lit=0;
+        if(FORK_CORNER_LIT_MIN>0){
+            if(left_hits>=FORK_CORNER_LIT_MIN ||
+               right_hits>=FORK_CORNER_LIT_MIN)corner_lit=1;
+        }
         /* FORK_MODE kept as a 3-way selector: the real-car one-edge test (1)
            has NOT been validated on the car yet, so 0/2 stay available for
            A/B comparison during the island test sequence. */
@@ -408,16 +442,24 @@ static void track_control(float *v,float *w){
             fork=shape && (near_left || near_right);
         else
             fork=shape;
+        /* Veto applies to ALL FORK_MODE variants, so a sharp corner cannot
+           be mistaken for an island entrance regardless of the A/B setting. */
+        if(corner_lit)fork=0;
         /* Narrow edge probe = real island entry. A wide probe, one whole side
            lit, or the full bar means a sharp corner: never open the hold. */
         int probe_narrow=
             (near_left  && w0>=FORK_HOLD_SEG_MIN && w0<=FORK_HOLD_SEG_MAX) ||
             (near_right && wN>=FORK_HOLD_SEG_MIN && wN<=FORK_HOLD_SEG_MAX);
-        int corner_wide=wide ||
+        int corner_wide=wide || corner_lit ||
             (left_hits>=CORNER_HALF_HITS || right_hits>=CORNER_HALF_HITS);
         island_pair=fork && probe_narrow && !corner_wide;
+        /* One-lit probe: fork is valid but probe_narrow fails, so no sticky
+           window. Flag it for a single-frame hold in the e stage below. */
+        one_lit_probe=(FORK_HOLD_ONE_LIT && fork && !corner_wide &&
+            ((near_left && w0==1) || (near_right && wN==1)));
     }
     dbg_island_pair=island_pair;
+    dbg_one_lit=one_lit_probe;
     int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
                  fabsf(weight)<CENTRAL_WEIGHT_MAX);
     /* Severity drives the graded slowdown for EVERY bend; this boolean only
@@ -489,16 +531,55 @@ static void track_control(float *v,float *w){
     if(track_state==BRANCH){
         unsigned ph_ms=state_ms-island_phase_start;
         if(island_phase==IS_ARMED){
-            int trigger=0;
+            int trigger=0,hard=0;
             if(BRANCH_TURN_TRIGGER==0)trigger=1;
             else if(BRANCH_TURN_TRIGGER==1){
                 if(groups==1)island_fall_frames++;
                 else island_fall_frames=0;
-                trigger=(island_fall_frames>=BRANCH_FALL_FRAMES);
+                int fall_now=(island_fall_frames>=BRANCH_FALL_FRAMES);
+                /* Latch the fall-back: while crossing the 0..9 junction
+                   fill the group count flickers 1<->2, and the two-segment
+                   wait must not restart on every flicker. With the switch
+                   off this is bit-for-bit the old per-frame test. */
+                if(BRANCH_ARM_WAIT_TWO && fall_now)island_fell=1;
+                trigger=BRANCH_ARM_WAIT_TWO?(int)island_fell:fall_now;
             }else if(BRANCH_TURN_TRIGGER==2)
                 trigger=(app_s-entry_s>=BRANCH_TURN_DIST);
-            if((int)state_ms>=(int)BRANCH_WAIT_MAX_MS)trigger=1;
-            if(trigger){island_phase=IS_TURN_IN;island_phase_start=state_ms;}
+            if((int)state_ms>=(int)BRANCH_WAIT_MAX_MS){
+                trigger=1;
+                /* WAIT_MAX is the "no fall-back at all" deadline. Once the
+                   fall-back has been seen, BRANCH_TWO_MAX_MS owns the split
+                   wait; do not cut that wait short here. */
+                hard=!(BRANCH_ARM_WAIT_TWO && BRANCH_TURN_TRIGGER==1 &&
+                       island_fell);
+            }
+            /* New decision: a single wide band is NOT the island branch.
+               Stay in IS_ARMED (e slew + dterm=0, so a flickering band
+               cannot kick w) until two segments reappear, then start the
+               entrance turn with a forced LEFT pick. Two timeouts keep the
+               old blind turn available: BRANCH_TWO_MAX_MS is measured from
+               the fall-back, BRANCH_WAIT_MAX_MS from track_enter(BRANCH). */
+            if(BRANCH_ARM_WAIT_TWO && BRANCH_TURN_TRIGGER==1 &&
+               trigger && !hard){
+                if(groups>=2){
+                    if(island_two_frames<BRANCH_TWO_FRAMES)
+                        island_two_frames++;
+                }else{
+                    island_two_frames=0;
+                    if(!island_two_wait){
+                        island_two_wait=1;island_fall_ms=state_ms;
+                    }
+                }
+                int split_ok=(island_two_frames>=BRANCH_TWO_FRAMES);
+                int split_timeout=(island_two_wait &&
+                    (int)(state_ms-island_fall_ms)>=(int)BRANCH_TWO_MAX_MS);
+                if(split_ok)island_two_ok=1;
+                trigger=(split_ok||split_timeout);
+            }
+            if(trigger){
+                island_phase=IS_TURN_IN;island_phase_start=state_ms;
+                island_two_wait=0;island_two_frames=0;
+            }
         }else if(island_phase==IS_TURN_IN){
             if((int)ph_ms>=(int)BRANCH_TURN_MS){island_phase=IS_LOOP;island_phase_start=state_ms;}
         }else if(island_phase==IS_LOOP){
@@ -600,7 +681,13 @@ static void track_control(float *v,float *w){
         float dist=fabsf((starts[i]+ends[i])/11.0f-1.0f-app_line_prev);
         if(dist<best){pick=i;best=dist;}
     }
-    if(track_state==BRANCH && ISLAND_FORCE_SIDE){
+    /* IS_ARMED keeps FOLLOW's nearest-segment pick. Forcing ISLAND_SIDE here
+       yanks e from the straight segment to the edge probe (1.36 apart) and
+       FORK_E_SLEW drags that switch into a ~136 ms steering swing. Single
+       segments pick index 0 either way, so only two-segment frames differ.
+       IS_LOOP / IS_TURN_OUT / IS_LEAVE still get the forced side. */
+    if(track_state==BRANCH && ISLAND_FORCE_SIDE &&
+       island_phase!=IS_ARMED){
         /* Exiting: the two-segment pattern reappears during the final turn
            and the RIGHT segment is the one leading out. Follow it through
            IS_TURN_OUT + IS_LEAVE instead of the entry-side segment. */
@@ -613,6 +700,13 @@ static void track_control(float *v,float *w){
             side=ISLAND_OUT_FOLLOW_SIDE;
         pick=side<0 ? 0 : groups-1;
     }
+    /* New entry decision: once the two-segment pattern is confirmed, the
+       LEFT segment is the island branch. Force it for the entrance turn
+       independently of ISLAND_FORCE_SIDE so this A/B switch stands alone.
+       A single segment is already pick=0, and TURN_OUT/LEAVE are untouched. */
+    if(BRANCH_ARM_WAIT_TWO && island_two_ok && groups>=2 &&
+       track_state==BRANCH && island_phase==IS_TURN_IN)
+        pick=0;
     float e=(starts[pick]+ends[pick])/11.0f-1.0f;
     /* A two-segment pattern shows up a few frames BEFORE FORK_FRAMES confirms
        the island entry. Those frames are still FOLLOW, where ISLAND_FORCE_SIDE
@@ -623,13 +717,30 @@ static void track_control(float *v,float *w){
     /* Sticky, island-only hold. Sharp-corner patterns have a wide probe and
        never open the window, so they keep their normal PD response. */
     int in_window=(FORK_ENTRY_HOLD && track_state==FOLLOW && fork_hold_tail>0);
+    /* A single-lit edge probe never opens the sticky window. Hold e for
+       THIS frame only: no 100 ms window (corners stay responsive), no
+       release counter, no slew. Suppressed while a window/release is active
+       so the existing sticky behaviour is not disturbed. */
+    int one_lit_hold=(FORK_ENTRY_HOLD && FORK_HOLD_ONE_LIT &&
+                      track_state==FOLLOW && one_lit_probe &&
+                      !in_window && fork_release==0);
     /* On the frame track_enter(BRANCH) fires, ISLAND_FORCE_SIDE suddenly
        forces pick onto the ISLAND_SIDE segment and track_d_ready is cleared.
-       Slew e through the whole IS_ARMED phase instead of switching abruptly;
-       IS_TURN_IN and later are untouched. */
-    int entry_slew=(FORK_ENTRY_HOLD && track_state==BRANCH &&
-                    island_phase==IS_ARMED);
+       Slew e through the whole IS_ARMED phase instead of switching abruptly.
+       BRANCH_ARM_WAIT_TWO below extends that slew into IS_TURN_IN as well. */
+    /* With BRANCH_ARM_WAIT_TWO the wide junction band is still present
+       while IS_ARMED waits, and can briefly reappear inside IS_TURN_IN.
+       Keep the e slew (and dterm=0 below) through TURN_IN too, so no
+       single-frame band edge change can kick w. FORK_E_SLEW==0 freezes e,
+       so in that case the TURN_IN extension is disabled. With the switch
+       off this collapses to the old IS_ARMED-only condition. */
+    int armed_slew=(FORK_ENTRY_HOLD||BRANCH_ARM_WAIT_TWO)&&
+                   island_phase==IS_ARMED;
+    int turn_in_slew=(BRANCH_ARM_WAIT_TWO && FORK_E_SLEW>0.0f &&
+                      island_phase==IS_TURN_IN);
+    int entry_slew=(track_state==BRANCH&&(armed_slew||turn_in_slew));
     if(in_window){e=app_error_prev;fork_release=FORK_HOLD_RELEASE;}
+    else if(one_lit_hold)e=app_error_prev;
     else if(track_state==FOLLOW && fork_release>0){
         e=app_error_prev+app_clip(e-app_error_prev,-FORK_E_SLEW,FORK_E_SLEW);
         fork_release--;
@@ -642,7 +753,7 @@ static void track_control(float *v,float *w){
     float de=track_d_ready?app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
     /* B-tier option 2: dbend covers the whole lit pattern, so a segment switch
        cannot kick it. BEND_D_SCALE puts it in the same units as de. */
-    float dterm=(in_window||fork_release>0||entry_slew)?0.0f:
+    float dterm=(in_window||one_lit_hold||fork_release>0||entry_slew)?0.0f:
         ((BEND_ENABLE && BEND_D_USE_DBEND)?
             app_clip(dbend*BEND_D_SCALE,-LINE_D_MAX,LINE_D_MAX):de);
     /* One flag for both effects: after a confirmed straight, cancel the
@@ -670,7 +781,7 @@ static void track_control(float *v,float *w){
     if(track_state==FOLLOW && !straight_release &&
        (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
         *v=fminf(*v,CORNER_SLOW_MPS);
-    if(fork || track_state==BRANCH)*v=fminf(*v,0.15f);
+    if(fork || track_state==BRANCH)*v=fminf(*v,0.22f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
        output rather than replacing it, so the chosen line is still tracked. */
     if(track_state==BRANCH && BRANCH_TURN_ENABLE){
@@ -839,10 +950,11 @@ static void app_log(void){
                ff fork_frames, oa island_out_armed, fl island_fall_frames,
                cf clear_frames, ph ms elapsed in current island phase,
                ip island_pair (1 = narrow island probe, 0 = corner/other),
-               sm continuous centred-line ms. */
+               sm continuous centred-line ms, tw two-segment wait,
+               tf consecutive two-segment frames. */
             n=snprintf(app_tx,sizeof(app_tx),
               "M%d run%u F%u cal%u key%u L%ld R%ld vL%ld vR%ld s%ld a%ld z%ld q%03X uL%ld uR%ld"
-              " | S%d P%d T%lu G%d tot%d fk%d cn%d ff%d oa%d fl%d cf%d ph%lu ip%d sm%lu kg%ld\r\n",
+              " | S%d P%d T%lu G%d tot%d fk%d cn%d ff%d oa%d fl%d tw%d tf%d cf%d ph%lu ip%d sm%lu kg%ld ol%d\r\n",
               APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable,
               (long)app_counts_l,(long)app_counts_r,(long)(app_vl*1000),
               (long)(app_vr*1000),(long)(app_s*1000),(long)(app_yaw*1800/PI_F),
@@ -850,9 +962,10 @@ static void app_log(void){
               (long)(app_cmd_l*1000),(long)(app_cmd_r*1000),
               track_state,island_phase,(unsigned long)state_ms,dbg_groups,
               dbg_total,dbg_fork,dbg_corner,fork_frames,island_out_armed,
-              island_fall_frames,clear_frames,
+              island_fall_frames,island_two_wait,island_two_frames,
+              clear_frames,
               (unsigned long)(state_ms-island_phase_start),dbg_island_pair,
-              (unsigned long)straight_ms,dbg_kp_gain);
+              (unsigned long)straight_ms,dbg_kp_gain,dbg_one_lit);
         }
         app_tx_len=n>0?(unsigned)n:0;
         if(app_tx_len>=sizeof(app_tx))app_tx_len=sizeof(app_tx)-1;
