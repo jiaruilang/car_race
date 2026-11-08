@@ -10,7 +10,7 @@
 /* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
    5 four left 90-degree turns; 6 line following; 7 static steering bench
    (v=0, spin in place, nudge the car and watch it recover). */
-#define APP_MODE 7
+#define APP_MODE 6
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
 #define RIGHT_FORWARD_HIGH 0
@@ -50,10 +50,25 @@
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
 /* State-machine telemetry on the Seekfree scope. 0 = original (CH7=cal),
    1 = CH7 becomes the state code, other 7 channels untouched,
-   2 = all 8 channels become state-machine diagnostics (50 Hz). */
-#define APP_SCOPE_STATE 1
-#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 2
+   2 = all 8 channels become state-machine diagnostics (50 Hz),
+   3 = corner speed test: v, v measured, w, corner, w cap, lit count,
+       state code, R PWM (50 Hz, all from the same tick). */
+#define APP_SCOPE_STATE 3
+#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 3
 #error Invalid APP_SCOPE_STATE
+#endif
+/* ---- Actual angular rate on the STATE 3 scope CSV ----------------------
+   Only APP_SCOPE_STATE==3 is affected; STATE 0/1/2 and text groups stay
+   exactly as they were. 0 = original 8 columns (CH7 = state code) so the
+   A/B baseline is bit-for-bit; 1 = insert the measured rate as CH7 and
+   shift state code / R PWM to CH8 / CH9 (9 columns, nothing lost);
+   2 = overwrite CH7 with the rate and keep 8 columns (state code lost).
+   The value is steer_gyro: the 20 ms low-passed gyro rate in rad/s that
+   the MODE1 rate loop actually feeds back, so CH3 (commanded w) and CH7
+   (measured w) are the same unit and the same 50 Hz frame. x1000. */
+#define APP_SCOPE_GYRO_CH7 1
+#if APP_SCOPE_GYRO_CH7 < 0 || APP_SCOPE_GYRO_CH7 > 2
+#error Invalid APP_SCOPE_GYRO_CH7
 #endif
 #define DT 0.005f
 #define PI_F 3.14159265358979f /* TRUE pi: physical dps->rad/s and log conversion ONLY */
@@ -140,6 +155,16 @@ static int app_parameters_ok(void){
 }
 /* MODE6 trial settings. Channels 0..11 run from left to right. */
 #define TRACK_CRUISE TEST_SPEED_MPS
+/* ---- Constant-speed A/B test -------------------------------------------
+   1: FOLLOW holds TRACK_CRUISE everywhere - no |w| slowdown, no graded
+      bend slowdown, no corner-approach cap. Island (fork/BRANCH 0.22 cap
+      and BRANCH_TURN_V) is deliberately left untouched.
+   0: original coupled chain, see track_control(). */
+#define TRACK_FLAT_SPEED 1
+/* Reserved: right-angle-only cap, independent of the switch above.
+   0=off; fill a positive m/s later to slow corners while the rest of the
+   lap stays at cruise. Uses the same corner test as CORNER_SLOW_MPS. */
+#define TRACK_CORNER_ONLY_MPS 0.0f
 #define ISLAND_SIDE -1 /* -1 left, +1 right, 0 stop at candidate for inspection */
 #define CENTRAL_TOTAL_MAX 9     /* widest single segment still a normal line (was 6: 7..9 grey band) */
 #define CENTRAL_WEIGHT_MAX 2.0f /* |weighted sum| below this => line is centred */
@@ -273,6 +298,9 @@ static int dbg_one_lit; /* single-lit island probe seen this tick */
 static int fork_hold_tail, fork_release; /* sticky pre-island steering hold */
 static unsigned straight_ms; /* continuous centred-line time (ms) */
 static long dbg_kp_gain; /* kp*100, refreshed on line-following frames only */
+/* Published for app_log(): commanded body speed, angular rate, and the w
+   cap actually used this tick (x1000 on the scope / text log). */
+static float dbg_v, dbg_w, dbg_wcap;
 static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 
 /* 1: line PD -> yaw-rate PID -> wheel PI
@@ -284,9 +312,18 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 #if TRACK_STEER_MODE < 1 || TRACK_STEER_MODE > 3
 #error Invalid TRACK_STEER_MODE
 #endif
-#define STEER2_KP2 0.10f
-#define STEER2_GYRO_KD 0.04f
-#define RATE_KP 0.30f
+/* ---- Steering rate cap + right-angle corner A/B test -------------------
+   steer_line() used to clip w at a hard-coded +/-2.0 rad/s in all three
+   modes. CORNER_W_TEST raises that cap ONLY on FOLLOW frames where the
+   corner test fires, so the pure line-PD loop can be pushed to its real
+   over-corner speed limit. 0 = bit-for-bit the original behaviour.
+   CORNER_TEST_W_LIMIT is the raised cap; STEER_W_LIMIT is the normal one. */
+#define STEER_W_LIMIT 5.0f
+#define CORNER_W_TEST 1
+#define CORNER_TEST_W_LIMIT 5.0f
+#define STEER2_KP2 1.50f
+#define STEER2_GYRO_KD 0.06f
+#define RATE_KP 0.4f
 #define RATE_KI 0.0f
 #define RATE_KD 0.0f
 #define RATE_GYRO_TAU 0.020f
@@ -296,8 +333,8 @@ static int rate_ready;
 static void steer_reset(void){
     rate_i=0;rate_prev=0;rate_ready=0;steer_gyro=0;
 }
-static float steer_line(float e,float dterm,float kp,int valid_previous){
-    float desired=app_clip(-(kp*e+LINE_KD*dterm),-2.0f,2.0f);
+static float steer_line(float e,float dterm,float kp,int valid_previous,float wcap){
+    float desired=app_clip(-(kp*e+LINE_KD*dterm),-wcap,wcap);
 #if TRACK_STEER_MODE == 1
     if(!valid_previous){rate_i=0;rate_ready=0;}
     float error=desired-steer_gyro;
@@ -306,12 +343,12 @@ static float steer_line(float e,float dterm,float kp,int valid_previous){
     float next=app_clip(rate_i+RATE_KI*error*DT,-RATE_I_LIMIT,RATE_I_LIMIT);
     /* desired is a nominal kinematic feedforward; PID corrects rate error. */
     float raw=desired+RATE_KP*error+next+RATE_KD*derivative;
-    float output=app_clip(raw,-2.0f,2.0f);
+    float output=app_clip(raw,-wcap,wcap);
     if(raw==output || (raw>output && error<0) || (raw<output && error>0))rate_i=next;
     return output;
 #elif TRACK_STEER_MODE == 2
     return app_clip(-(kp*e+LINE_KD*dterm+STEER2_KP2*e*fabsf(e))
-                    -STEER2_GYRO_KD*steer_gyro,-2.0f,2.0f);
+                    -STEER2_GYRO_KD*steer_gyro,-wcap,wcap);
 #else
     return desired;
 #endif
@@ -329,7 +366,7 @@ static float steer_line(float e,float dterm,float kp,int valid_previous){
    All three TRACK_STEER_MODE variants are reused unchanged; steer_gyro keeps
    being updated every tick in app_control(), so the gyro feedback of modes
    1 and 2 is live.                                                        */
-#define MODE7_W_LIMIT 2.0f    /* cap on |w| (rad/s); default = steer_line's own clip */
+#define MODE7_W_LIMIT 3.0f    /* cap on |w| (rad/s); default = steer_line's own clip */
 /* MODE7_CRUISE_MPS is defined near the top of the file so
    app_parameters_ok() can validate it; applied in app_control(). */
 #define MODE7_KICK_PWM 0.0f  /* 0=off. Optional start-up duty floor for tiny
@@ -377,7 +414,7 @@ static void steer_test_control(float *w,float *e_out){
     *e_out=e;
     float de=steer_test_d_ready?
         app_clip((e-steer_test_e_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
-    *w=app_clip(steer_line(e,de,LINE_KP,steer_test_d_ready),
+    *w=app_clip(steer_line(e,de,LINE_KP,steer_test_d_ready,MODE7_W_LIMIT),
                 -MODE7_W_LIMIT,MODE7_W_LIMIT);
     steer_test_e_prev=e;steer_test_d_ready=1;
 }
@@ -786,22 +823,38 @@ static void track_control(float *v,float *w){
     if(BEND_ENABLE && BEND_KP_ENABLE && !straight_release)
         kp*=1.0f+BEND_KP_K*severity;
     dbg_kp_gain=(long)(kp*100.0f);
-    *w=steer_line(e,dterm,kp,track_d_ready);
+    /* Right-angle corner A/B: widen the w cap ONLY while the corner test
+       fires in FOLLOW. Everywhere else (island, CROSS, SEARCH, MODE7) the
+       cap stays STEER_W_LIMIT, so the A/B switch is isolated. */
+    float wcap=(CORNER_W_TEST && track_state==FOLLOW && corner)?
+               CORNER_TEST_W_LIMIT:STEER_W_LIMIT;
+    dbg_wcap=wcap;
+    *w=steer_line(e,dterm,kp,track_d_ready,wcap);
     app_error_prev=app_line_prev=e;track_d_ready=1;
-    /* straight_release also cancels the bend and corner slowdowns below.
-       The w-based cap and the fork/BRANCH 0.15 cap stay, so steering and
-       island behaviour are untouched. */
-    *v=TRACK_CRUISE/(1+fabsf(*w));
-    /* Graded slowdown: every bend reduces v, not just a right-angle corner.
-       The old binary cap remains as the extreme end of the same scale. */
-    if(BEND_ENABLE && BEND_SLOW_K>0.0f && !straight_release)
-        *v=fminf(*v,TRACK_CRUISE/(1.0f+BEND_SLOW_K*severity));
-    /* Corner approach: cap speed by how far the lit pattern has shifted, but
-       keep the PD steering instead of overriding w with a fixed bang-bang. */
-    if(track_state==FOLLOW && !straight_release &&
+    /* Constant-speed test: cut the |w|->v and bend->v coupling so FOLLOW
+       holds TRACK_CRUISE everywhere. The island caps below are untouched. */
+    if(TRACK_FLAT_SPEED){
+        *v=TRACK_CRUISE;
+    }else{
+        /* straight_release also cancels the bend and corner slowdowns below.
+           The fork/BRANCH cap stays, so island behaviour is untouched. */
+        *v=TRACK_CRUISE/(1+fabsf(*w));
+        /* Graded slowdown: every bend reduces v, not just a right-angle
+           corner. The old binary cap is the extreme end of the same scale. */
+        if(BEND_ENABLE && BEND_SLOW_K>0.0f && !straight_release)
+            *v=fminf(*v,TRACK_CRUISE/(1.0f+BEND_SLOW_K*severity));
+        /* Corner approach: cap speed by how far the lit pattern shifted,
+           but keep the PD steering instead of a fixed bang-bang w. */
+        if(track_state==FOLLOW && !straight_release &&
+           (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
+            *v=fminf(*v,CORNER_SLOW_MPS);
+    }
+    /* Reserved right-angle-only cap: works in BOTH speed modes, so a corner
+       can be slowed later without restoring the whole graded slowdown. */
+    if(TRACK_CORNER_ONLY_MPS>0.0f && track_state==FOLLOW &&
        (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
-        *v=fminf(*v,CORNER_SLOW_MPS);
-    if(fork || track_state==BRANCH)*v=fminf(*v,0.22f);
+        *v=fminf(*v,TRACK_CORNER_ONLY_MPS);
+    if(fork || track_state==BRANCH)*v=fminf(*v,0.35f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
        output rather than replacing it, so the chosen line is still tracked. */
     if(track_state==BRANCH && BRANCH_TURN_ENABLE){
@@ -809,7 +862,7 @@ static void track_control(float *v,float *w){
         if(island_phase==IS_TURN_IN)dir=BRANCH_TURN_DIR;
         else if(island_phase==IS_TURN_OUT){dir=ISLAND_OUT_DIR;turn_w=ISLAND_TURN_OUT_W;}
         if(dir){
-            *w=app_clip(*w+dir*ISLAND_SIDE*turn_w,-2,2);
+            *w=app_clip(*w+dir*ISLAND_SIDE*turn_w,-STEER_W_LIMIT,STEER_W_LIMIT);
             *v=fminf(*v,BRANCH_TURN_V);
         }
     }
@@ -826,6 +879,7 @@ static void app_start(void){
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
     unsigned floor_release=0; /* MODE5: let the wheels stop once the angle is reached */
+    dbg_v=0;dbg_w=0;dbg_wcap=STEER_W_LIMIT;
     if(!app_running){app_target_l=0;app_target_r=0;return;}
     app_target_l=0;app_target_r=0;
     app_elapsed+=5;
@@ -887,6 +941,7 @@ static void app_control(float gz_rad){
         v=MODE7_CRUISE_MPS>0.0f?
           MODE7_CRUISE_MPS+fabsf(w)*EFFECTIVE_TRACK_M*0.5f:0.0f;
     }
+    dbg_v=v;dbg_w=w;
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
     /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
        on |target| and keeps the sign, so MODE5 still spins in place (opposite
@@ -953,7 +1008,49 @@ static void app_log(void){
     if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
         int n;app_last_log=HAL_GetTick();
         if(APP_SCOPE){
-#if APP_SCOPE_STATE == 2
+#if APP_SCOPE_STATE == 3
+            /* Corner speed test: every value is from the SAME 50 Hz tick, so
+               v / w / corner / w-cap / lit-count can be read together while
+               stepping TEST_SPEED_MPS up to the over-corner limit.
+               CH1 v cmd, CH2 v measured ((vL+vR)/2), CH3 w COMMAND,
+               CH4 corner, CH5 w cap used this tick, CH6 lit sensor count
+               (0 = line lost). APP_SCOPE_GYRO_CH7 selects the tail:
+                 0: CH7 state code,       CH8 R PWM            (8 cols)
+                 1: CH7 w MEASURED, CH8 state code, CH9 R PWM (9 cols)
+                 2: CH7 w MEASURED,       CH8 R PWM            (8 cols)
+               w MEASURED is steer_gyro, the 20 ms low-passed gyro rate the
+               MODE1 rate loop feeds back; x1000 like CH3, in rad/s.
+               x1000 except CH4/CH6 and the state-code column. */
+#if APP_SCOPE_GYRO_CH7 == 1
+            n=snprintf(app_tx,sizeof(app_tx),
+              "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+              (long)(dbg_v*1000),
+              (long)((app_vl+app_vr)*500.0f),
+              (long)(dbg_w*1000),(long)dbg_corner,
+              (long)(dbg_wcap*1000),(long)dbg_total,
+              (long)(steer_gyro*1000),
+              (long)(track_state*10+island_phase),
+              (long)(app_cmd_r*1000));
+#elif APP_SCOPE_GYRO_CH7 == 2
+            n=snprintf(app_tx,sizeof(app_tx),
+              "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+              (long)(dbg_v*1000),
+              (long)((app_vl+app_vr)*500.0f),
+              (long)(dbg_w*1000),(long)dbg_corner,
+              (long)(dbg_wcap*1000),(long)dbg_total,
+              (long)(steer_gyro*1000),
+              (long)(app_cmd_r*1000));
+#else
+            n=snprintf(app_tx,sizeof(app_tx),
+              "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+              (long)(dbg_v*1000),
+              (long)((app_vl+app_vr)*500.0f),
+              (long)(dbg_w*1000),(long)dbg_corner,
+              (long)(dbg_wcap*1000),(long)dbg_total,
+              (long)(track_state*10+island_phase),
+              (long)(app_cmd_r*1000));
+#endif
+#elif APP_SCOPE_STATE == 2
             /* All 8 channels dedicated to the island state machine (50 Hz).
                CH1 state code = track_state*10 + island_phase
                     (0 FOLLOW, 10 CROSS, 20..25 BRANCH phases, 30 SEARCH)
@@ -996,11 +1093,16 @@ static void app_log(void){
                     APP_MODE,app_running,app_fault,app_cal_ready,app_key_stable);
                 break;
             case 1:
+                /* vc = commanded body speed, w = angular rate, wl = w cap
+                   (all x1000). Same frame as vL/vR/uL/uR: corner speed
+                   tests need v and w together, not spread over groups. */
                 n=snprintf(app_tx,sizeof(app_tx),
-                    "B L%ld R%ld vL%ld vR%ld uL%ld uR%ld\r\n",
+                    "B L%ld R%ld vL%ld vR%ld uL%ld uR%ld vc%ld w%ld wl%ld\r\n",
                     (long)app_counts_l,(long)app_counts_r,
                     (long)(app_vl*1000),(long)(app_vr*1000),
-                    (long)(app_cmd_l*1000),(long)(app_cmd_r*1000));
+                    (long)(app_cmd_l*1000),(long)(app_cmd_r*1000),
+                    (long)(dbg_v*1000),(long)(dbg_w*1000),
+                    (long)(dbg_wcap*1000));
                 break;
             case 2:
                 n=snprintf(app_tx,sizeof(app_tx),
