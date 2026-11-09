@@ -28,10 +28,10 @@
 #define SPEED_FF_R 0.231f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
 #define SPEED_FF_TURN_L 0.28f  /* MODE5 only: spin-in-place load differs from straight running */
 #define SPEED_FF_TURN_R 0.47f /* tune = steady turn duty / steady turn wheel speed */
-#define MAX_PWM 0.30f
+#define MAX_PWM 0.40f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.45f
+#define TEST_SPEED_MPS 0.50f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
@@ -318,9 +318,27 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
    corner test fires, so the pure line-PD loop can be pushed to its real
    over-corner speed limit. 0 = bit-for-bit the original behaviour.
    CORNER_TEST_W_LIMIT is the raised cap; STEER_W_LIMIT is the normal one. */
-#define STEER_W_LIMIT 5.0f
+#define STEER_W_LIMIT 20.0f
 #define CORNER_W_TEST 1
-#define CORNER_TEST_W_LIMIT 5.0f
+#define CORNER_TEST_W_LIMIT 20.0f
+/* ---- Corner speed test: disable the SEARCH line-loss fallback -----------
+   SEARCH is entered at exactly one place: the FOLLOW branch of
+   track_control(), when a latched corner side is followed by a FULLY LOST
+   line (edge_age<=24). It then spins in place at SEARCH_SPIN_W until the
+   line is found, which HIDES a genuine corner overshoot on the scope -- the
+   car recovers instead of showing that it left the track.
+   CORNER_NO_SEARCH 1 removes that branch; a lost line falls through to the
+   existing FOLLOW lost-line handler (motors off immediately, then fault 5
+   after 10 frames), so an overshoot reads as a clean stop.
+   0 = original behaviour, byte-for-byte (the #if keeps the old line).
+   A/B: run the same speed with 0 as baseline, then with 1. If the car
+   stops at the corner with 1, that speed overshoots.
+   NOTE: global while enabled -- any corner-adjacent line loss (including
+   the island exit) will no longer be recovered. */
+#define CORNER_NO_SEARCH 0
+#if CORNER_NO_SEARCH < 0 || CORNER_NO_SEARCH > 1
+#error Invalid CORNER_NO_SEARCH
+#endif
 #define STEER2_KP2 1.50f
 #define STEER2_GYRO_KD 0.06f
 #define RATE_KP 0.4f
@@ -328,6 +346,27 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 #define RATE_KD 0.0f
 #define RATE_GYRO_TAU 0.020f
 #define RATE_I_LIMIT 0.5f
+/* ---- Method B: speed x curvature feed-forward (MODE6 FOLLOW only) ------
+   w = PD(e) + w_ff,  w_ff = -WFF_K * TRACK_CRUISE * corner_side * gate.
+   The wheel PI already tracks w accurately, so a small speed-scaled turn-in
+   added AHEAD of the corner removes the slight overshoot seen at the current
+   MODE6 speed without re-tuning the line PD (kp / KP2 / KDg stay calibrated).
+   WFF_ENABLE 0 = the original control law, byte-for-byte.
+   WFF_MODE 1 = gate on the existing `corner` flag (crisp, right-angle);
+            2 = continuous severity gate (use if single-frame corner hits
+                cause a twitch on gentle-bend entry/exit frames).
+   WFF_K is 1/m-ish: at gate=1, w_ff = WFF_K * TRACK_CRUISE rad/s.
+   WFF_MAX_W clamps |w_ff| so a bad calibration cannot run away. */
+#define WFF_ENABLE 1
+#if WFF_ENABLE < 0 || WFF_ENABLE > 1
+#error Invalid WFF_ENABLE
+#endif
+#define WFF_MODE 1
+#if WFF_MODE < 1 || WFF_MODE > 2
+#error Invalid WFF_MODE
+#endif
+#define WFF_K 20.0f
+#define WFF_MAX_W 100.0f
 static float steer_gyro, rate_i, rate_prev;
 static int rate_ready;
 static void steer_reset(void){
@@ -579,7 +618,11 @@ static void track_control(float *v,float *w){
             fork_hold_tail=0;fork_release=0;
             if(!ISLAND_SIDE){app_fail(5);return;}
             track_enter(BRANCH);
+#if !CORNER_NO_SEARCH
         }else if(!total && edge_age<=24 && edge_side) track_enter(SEARCH);
+#else
+        }   /* CORNER_NO_SEARCH: no recovery spin; lost line stops the car */
+#endif
     }
     if(track_state!=FOLLOW)state_ms+=5;
     /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
@@ -830,6 +873,32 @@ static void track_control(float *v,float *w){
                CORNER_TEST_W_LIMIT:STEER_W_LIMIT;
     dbg_wcap=wcap;
     *w=steer_line(e,dterm,kp,track_d_ready,wcap);
+#if WFF_ENABLE
+    /* ---- Method B: speed x curvature feed-forward on w -----------------
+       v_set is TRACK_CRUISE (the speed SETPOINT), NOT *v: here *v is still
+       0 (app_control seeds v=0) and is decided BELOW from |w|, so using *v
+       would close a w->v->w algebraic loop with the L841 slowdown. Under
+       TRACK_FLAT_SPEED the two are identical anyway.
+       dir = corner_side = sign(weight) (+1 right, -1 left), the SIGN of the
+       pattern and never the error e; the leading minus keeps w_ff the same
+       sign as the -(kp*e) PD term, i.e. a turn-IN, not a gain on the PD.
+       gate = 0 on a straight, so the car cannot draw circles. Only FOLLOW
+       reaches this line with track_state==FOLLOW; CROSS / SEARCH return
+       earlier, BRANCH is excluded by the test, and MODE7 calls
+       steer_line() from steer_test_control() instead of here.
+       A/B: WFF_ENABLE 0 removes this whole block byte-for-byte. */
+    if(track_state==FOLLOW){
+        float gate;
+#if WFF_MODE == 1
+        gate=corner?1.0f:0.0f;
+#else
+        gate=app_clip(severity/BEND_SEARCH_MIN,0.0f,1.0f);
+#endif
+        float wff=-WFF_K*TRACK_CRUISE*(float)corner_side*gate;
+        wff=app_clip(wff,-WFF_MAX_W,WFF_MAX_W);
+        *w=app_clip(*w+wff,-wcap,wcap);
+    }
+#endif
     app_error_prev=app_line_prev=e;track_d_ready=1;
     /* Constant-speed test: cut the |w|->v and bend->v coupling so FOLLOW
        holds TRACK_CRUISE everywhere. The island caps below are untouched. */
