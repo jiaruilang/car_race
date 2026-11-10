@@ -54,7 +54,7 @@
    3 = corner speed test: v, v measured, w, corner, w cap, lit count,
        state code, R PWM (50 Hz, all from the same tick). */
 #define APP_SCOPE_STATE 3
-#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 3
+#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 4
 #error Invalid APP_SCOPE_STATE
 #endif
 /* ---- Actual angular rate on the STATE 3 scope CSV ----------------------
@@ -252,7 +252,7 @@ static int app_parameters_ok(void){
    taken as the exit signal. Ignore every fork while state_ms is below this
    window (measured from track_enter(BRANCH), same origin as entry_yaw /
    entry_s). 0 disables blanking entirely. Tune against the scope trace. */
-#define ISLAND_OUT_BLANK_MS 3000u
+#define ISLAND_OUT_BLANK_MS 1000u
 #define ISLAND_LEAVE_MS 1500u   /* straight running before returning to FOLLOW */
 #define ISLAND_OUT_DIR -1       /* +1/-1: final turn direction relative to ISLAND_SIDE */
 /* ---- Active island turn ---- */
@@ -302,6 +302,8 @@ static long dbg_kp_gain; /* kp*100, refreshed on line-following frames only */
    cap actually used this tick (x1000 on the scope / text log). */
 static float dbg_v, dbg_w, dbg_wcap;
 static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
+
+#include "course_element_test.h"
 
 /* 1: line PD -> yaw-rate PID -> wheel PI
    2: nonlinear line PD + gyro damping -> wheel PI
@@ -367,6 +369,114 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
 #endif
 #define WFF_K 20.0f
 #define WFF_MAX_W 100.0f
+/* ---- Three-band feed-forward: straight / 120-deg / right-angle ---------
+   WFF_120_ENABLE 0 = the original WFF block is compiled byte-for-byte.
+   WFF_120_ENABLE 1 = a graded replacement, so the A/B is exact.
+
+   TUBE NUMBERING (2026-11-10 correction): the user labels the 12 tubes
+   1..12, but the code indexes them 0..11 in app_mask / starts[] / ends[].
+   "Tube 9" is ends[0]==8; the bar centre i=5.5 is tube 6.5; the mirror
+   is tube n <-> 13-n (tube 5 <-> 8, tube 9 <-> 4). WFF_120_1BASED 1
+   makes EDGE_* 1-based tube numbers and converts with +1 at the compare;
+   0 restores the old 0-based indices AND the old DEAD/FULL, so A/B is
+   exact. All the bend values below are recomputed for 1-based tubes.
+
+   Why a SHAPE gate as well as a deviation band: the straight runs
+   5-7 / 5-8 / 6-8 give bend = -0.0909 / 0 / +0.0909, while a 120-deg
+   entry widens the same run to 5-9 (0.0909), 5-10 (0.1818), 5-11
+   (0.2727), 5-12 (0.3636); a right-angle half-bar gives 0.5455.
+   6-8 and 5-9 both give 0.0909, so |bend| alone cannot tell "straight"
+   from "120". The shape test (ONE segment, >= TOTAL_MIN lit, edge
+   reached tube 9 or its mirror tube 4) is what makes the band
+   unambiguous.
+
+   Bands, in this order and mutually exclusive:
+     1 straight  -> BOTH feed-forwards forced to exactly 0 (kills the
+                    severity-gate straight-line jitter)
+     2 120-deg   -> |bend| in [DEAD, FULL) AND the run widened to an edge:
+                    w_ff = -WFF_120_K*TRACK_CRUISE*corner_side*gate120,
+                    gate120 ramps 0..1 across the band. Also active in
+                    BRANCH's line-following phases (WFF_120_IN_BRANCH).
+     3 corner    -> |bend| >= FULL or the `corner` flag: ORIGINAL WFF law
+                    (WFF_K / WFF_MODE), FOLLOW only, unaffected by
+                    WFF_120_IN_BRANCH
+     fork / wide / lost line / everything else -> 0
+   WFF_ENABLE gates band 3; WFF_120_ENABLE gates band 2. So the 120-deg
+   term can be calibrated on its own with WFF_ENABLE 0. */
+#define WFF_120_ENABLE 1
+#if WFF_120_ENABLE < 0 || WFF_120_ENABLE > 1
+#error Invalid WFF_120_ENABLE
+#endif
+/* ---- 120-deg term inside the island state machine ----------------------
+   BRANCH keeps running steer_line() as long as it has a line (L969); the
+   old scope test excluded it, so band 2 stopped dead at the island entry.
+   WFF_120_IN_BRANCH 1 adds the SAME band-2 term to BRANCH. Band 3 (the
+   right-angle WFF law) stays FOLLOW-only, so this switch cannot pull the
+   big-WFF_K term into the island.
+   By default the two active turn pulses (IS_TURN_IN / IS_TURN_OUT) are
+   excluded: BRANCH_TURN_ENABLE already adds a steering pulse there and
+   caps v to BRANCH_TURN_V. WFF_120_BRANCH_TURNS 1 includes them.
+   A/B: WFF_120_IN_BRANCH 0 compiles the exact original FOLLOW-only scope. */
+#define WFF_120_IN_BRANCH 1
+#if WFF_120_IN_BRANCH < 0 || WFF_120_IN_BRANCH > 1
+#error Invalid WFF_120_IN_BRANCH
+#endif
+#define WFF_120_BRANCH_TURNS 0
+#if WFF_120_BRANCH_TURNS < 0 || WFF_120_BRANCH_TURNS > 1
+#error Invalid WFF_120_BRANCH_TURNS
+#endif
+#define WFF_STRAIGHT_GATE 1
+#if WFF_STRAIGHT_GATE < 0 || WFF_STRAIGHT_GATE > 1
+#error Invalid WFF_STRAIGHT_GATE
+#endif
+#define WFF_STRAIGHT_BEND_MAX 0.30f
+#define WFF_120_TOTAL_MIN 5
+/* 1 = EDGE_* are 1-based tube numbers (user convention, corrected);
+   0 = legacy 0-based channel indices + legacy DEAD/FULL, byte-for-byte A/B. */
+#define WFF_120_1BASED 1
+#if WFF_120_1BASED < 0 || WFF_120_1BASED > 1
+#error Invalid WFF_120_1BASED: use 0 or 1
+#endif
+#if WFF_120_1BASED
+#define WFF_120_EDGE_HI   10    /* 1-based: tube 9 lit => 120-deg entry */
+#define WFF_120_EDGE_LO   3    /* 1-based: mirror of tube 9 (13-9=4) */
+#define WFF_120_DEAD      0.05f
+#define WFF_120_FULL      0.45f
+#else
+#define WFF_120_EDGE_HI   9    /* legacy: 0-based channel index 9 */
+#define WFF_120_EDGE_LO   2
+#define WFF_120_DEAD      0.20f
+#define WFF_120_FULL      0.50f
+#endif
+#define WFF_120_K         10.0f
+#define WFF_120_MAX_W     100.0f
+#define WFF_120_DIR       1
+/* DEAD/FULL/MAX_W are floats, so they cannot appear in a #if expression.
+   The runtime code guards the span and the clamp instead. */
+#if WFF_120_DIR != 1 && WFF_120_DIR != -1
+#error Invalid WFF_120_DIR: use 1 or -1
+#endif
+#if WFF_120_TOTAL_MIN < 2 || WFF_120_TOTAL_MIN > 12
+#error Invalid WFF_120_TOTAL_MIN
+#endif
+#if WFF_120_1BASED
+#if WFF_120_EDGE_HI < 1 || WFF_120_EDGE_HI > 12
+#error Invalid WFF_120_EDGE_HI (1-based tube number 1..12)
+#endif
+#if WFF_120_EDGE_LO < 1 || WFF_120_EDGE_LO > 12
+#error Invalid WFF_120_EDGE_LO (1-based tube number 1..12)
+#endif
+#else
+#if WFF_120_EDGE_HI < 0 || WFF_120_EDGE_HI > 11
+#error Invalid WFF_120_EDGE_HI (0-based channel index 0..11)
+#endif
+#if WFF_120_EDGE_LO < 0 || WFF_120_EDGE_LO > 11
+#error Invalid WFF_120_EDGE_LO (0-based channel index 0..11)
+#endif
+#endif
+#if WFF_120_EDGE_LO >= WFF_120_EDGE_HI
+#error Invalid WFF_120_EDGE band: LO must be below HI
+#endif
 static float steer_gyro, rate_i, rate_prev;
 static int rate_ready;
 static void steer_reset(void){
@@ -569,6 +679,10 @@ static void track_control(float *v,float *w){
     /* Publish before every early return below, so all control paths in
        this tick report the same fresh pattern snapshot to app_log(). */
     dbg_groups=groups;dbg_total=total;dbg_fork=fork;dbg_corner=corner;
+
+    elem_test_observe(track_state==BRANCH,track_state==CROSS,
+        island_phase==IS_LEAVE,wide,fork,groups,total,5u);
+
     /* Straight detector uses bend (the width-free line centre), NOT severity:
        with BEND_KP on, severity can stay artificially high on a straight,
        which is exactly the loop we want to break. */
@@ -752,7 +866,7 @@ static void track_control(float *v,float *w){
     }
     if(track_state==CROSS){
         if(state_ms>CROSS_TIMEOUT_MS){if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
-        *v=fminf(TRACK_CRUISE,0.18f);
+        *v=fminf(TRACK_CRUISE,0.30f);
         *w=app_clip(TRACK_HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
         return;
     }
@@ -873,7 +987,7 @@ static void track_control(float *v,float *w){
                CORNER_TEST_W_LIMIT:STEER_W_LIMIT;
     dbg_wcap=wcap;
     *w=steer_line(e,dterm,kp,track_d_ready,wcap);
-#if WFF_ENABLE
+#if WFF_ENABLE && !WFF_120_ENABLE
     /* ---- Method B: speed x curvature feed-forward on w -----------------
        v_set is TRACK_CRUISE (the speed SETPOINT), NOT *v: here *v is still
        0 (app_control seeds v=0) and is decided BELOW from |w|, so using *v
@@ -895,6 +1009,91 @@ static void track_control(float *v,float *w){
         gate=app_clip(severity/BEND_SEARCH_MIN,0.0f,1.0f);
 #endif
         float wff=-WFF_K*TRACK_CRUISE*(float)corner_side*gate;
+        wff=app_clip(wff,-WFF_MAX_W,WFF_MAX_W);
+        *w=app_clip(*w+wff,-wcap,wcap);
+    }
+#endif
+#if WFF_120_ENABLE
+    /* ---- Graded feed-forward: straight=0 / 120-deg band / corner band ----
+       CROSS / SEARCH / lost line return earlier; MODE7 uses
+       steer_test_control(). Band 2 runs in FOLLOW and, with
+       WFF_120_IN_BRANCH, in BRANCH's line-following phases. Band 3
+       (right-angle WFF) stays FOLLOW-only.
+       A/B: WFF_120_ENABLE 0 compiles the original block above instead,
+       so the graded path can be switched off byte-for-byte. */
+#if WFF_120_IN_BRANCH
+    /* BRANCH has no FOLLOW state: it stays BRANCH for the whole island and
+       still calls steer_line() while a line is visible. The two active turn
+       pulses are excluded by default (see the macro comment above). */
+    int wff120_scope=(track_state==FOLLOW);
+    if(track_state==BRANCH){
+#if WFF_120_BRANCH_TURNS
+        wff120_scope=1;
+#else
+        wff120_scope=(island_phase==IS_ARMED || island_phase==IS_LOOP ||
+                      island_phase==IS_LEAVE);
+#endif
+    }
+    if(wff120_scope){
+#else
+    if(track_state==FOLLOW){
+#endif
+        float d=fabsf(bend);
+        /* The discriminator the user described, in 1-based tube numbers:
+           a straight 5-8 / 5-7 / 6-8 widens to tube 9 then 10 on a left
+           turn; the mirror is tube 4 then 3 on a right turn. A straight
+           never reaches tube 9 or tube 4. starts[]/ends[] are 0-based,
+           so WFF_120_1BASED converts them with +1 at the comparison.
+           A/B: 1BASED 0 compiles the original 0-based test verbatim. */
+#if WFF_120_1BASED
+        int shape120=(groups==1 && total>=WFF_120_TOTAL_MIN &&
+                      (ends[0]+1>=WFF_120_EDGE_HI ||
+                       starts[0]+1<=WFF_120_EDGE_LO));
+#else
+        int shape120=(groups==1 && total>=WFF_120_TOTAL_MIN &&
+                      (ends[0]>=WFF_120_EDGE_HI ||
+                       starts[0]<=WFF_120_EDGE_LO));
+#endif
+        int straight=0;
+#if WFF_STRAIGHT_GATE
+        /* A plain centred run that has NOT widened to an edge. Forcing both
+           bands to exactly 0 here is what removes the straight jitter seen
+           with WFF_MODE 2 (severity never quite reaches 0 on a straight). */
+        straight=(groups==1 && total>0 &&
+                  total<=CENTRAL_TOTAL_MAX && !wide && !fork &&
+                  !corner && !shape120 &&
+                  d<WFF_STRAIGHT_BEND_MAX);
+#endif
+        int big=(corner || d>=WFF_120_FULL);
+        float wff=0.0f;
+        float gate120=0.0f;
+        float span=WFF_120_FULL-WFF_120_DEAD;
+        if(!straight && !big && shape120 && span>0.0f)
+            gate120=app_clip((d-WFF_120_DEAD)/span,0.0f,1.0f);
+        if(gate120>0.0f){
+            float wff120=-(float)WFF_120_DIR*WFF_120_K*TRACK_CRUISE*
+                         (float)corner_side*gate120;
+            float lim=fabsf(WFF_120_MAX_W);
+            wff+=app_clip(wff120,-lim,lim);
+        }
+#if WFF_ENABLE
+#if WFF_120_IN_BRANCH
+        /* Band 3 must NOT leak into the island, even when band 2 is enabled
+           there. Without this guard WFF_ENABLE 1 would inject the large
+           WFF_K term during BRANCH. */
+        else if(!straight && track_state==FOLLOW){
+#else
+        else if(!straight){
+#endif
+            float gate;
+#if WFF_MODE == 1
+            gate=big?1.0f:0.0f;
+#else
+            gate=app_clip(severity/BEND_SEARCH_MIN,0.0f,1.0f);
+#endif
+            wff+=-WFF_K*TRACK_CRUISE*(float)corner_side*gate;
+        }
+#endif
         wff=app_clip(wff,-WFF_MAX_W,WFF_MAX_W);
         *w=app_clip(*w+wff,-wcap,wcap);
     }
@@ -923,7 +1122,7 @@ static void track_control(float *v,float *w){
     if(TRACK_CORNER_ONLY_MPS>0.0f && track_state==FOLLOW &&
        (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
         *v=fminf(*v,TRACK_CORNER_ONLY_MPS);
-    if(fork || track_state==BRANCH)*v=fminf(*v,0.35f);
+    if(fork || track_state==BRANCH)*v=fminf(*v,0.45f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
        output rather than replacing it, so the chosen line is still tracked. */
     if(track_state==BRANCH && BRANCH_TURN_ENABLE){
@@ -944,6 +1143,7 @@ static void app_start(void){
     track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
     mode7_active=0;mode7_steady_ms=0;mode7_run_ms=0;
     app_last_completed=app_ms;app_running=1;
+    track_reset();elem_test_reset();steer_test_e_prev=0;steer_test_d_ready=0;
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
@@ -1077,7 +1277,9 @@ static void app_log(void){
     if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
         int n;app_last_log=HAL_GetTick();
         if(APP_SCOPE){
-#if APP_SCOPE_STATE == 3
+#if APP_SCOPE_STATE == 4
+            n=elem_test_csv(app_tx,(unsigned)sizeof(app_tx));
+#elif APP_SCOPE_STATE == 3
             /* Corner speed test: every value is from the SAME 50 Hz tick, so
                v / w / corner / w-cap / lit-count can be read together while
                stepping TEST_SPEED_MPS up to the over-corner limit.
