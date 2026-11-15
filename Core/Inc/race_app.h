@@ -9,10 +9,15 @@
 #include <stdlib.h>
 #include "course_config.h"
 
-/* 0 sensors; 1 left pulse; 2 right pulse; 3 speed; 4 one metre;
-   5 four left 90-degree turns; 6 line following; 7 static steering bench
-   (v=0, spin in place, nudge the car and watch it recover). */
+/* 3: fixed-speed test; 4: one-metre straight; 6: stage 2 race. */
 #define APP_MODE 6
+#if APP_MODE != 3 && APP_MODE != 4 && APP_MODE != 6
+#error Invalid APP_MODE: use 3, 4, or 6
+#endif
+#define TEST_SPEED_MPS 0.40f
+#define STOP_AHEAD_M 0.05f
+#define DISTANCE_KP 1.5f
+#define HEADING_KP 2.0f
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
 #define RIGHT_FORWARD_HIGH 0
@@ -28,26 +33,14 @@
 #define SPEED_KI_R 0.2f
 #define SPEED_FF_L 0.15f    /* feedforward duty per (m/s) of target; 0=off; L/R independent */
 #define SPEED_FF_R 0.231f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
-#define SPEED_FF_TURN_L 0.28f  /* MODE5 only: spin-in-place load differs from straight running */
-#define SPEED_FF_TURN_R 0.47f /* tune = steady turn duty / steady turn wheel speed */
+#define SPEED_FF_TURN_L 0.28f  /* SEARCH feedforward for the left wheel */
+#define SPEED_FF_TURN_R 0.47f /* SEARCH feedforward for the right wheel */
 #define MAX_PWM 0.50f
-#define TEST_PWM 0.042f
-#define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.40f
+#define COURSE_SPEED_MAX_MPS 0.40f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
-#define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.02f
 #define LINE_D_MAX 20.0f  /* clamp on de/dt so a stale error cannot kick the D term */
-#define HEADING_KP 2.0f   /* MODE4 only */
-#define TURN_KP 1.0f
-#define TURN_MAX_RAD_S 4.0f
-#define TURN_TOL_RAD 0.025f  /* angle window for a completed quarter turn; also releases the speed floor */
-#define MIN_SPEED_FLOOR_MODE6 1 /* 1: apply the wheel-speed floor in MODE6 too; 0: line mode exempt */
-#define MODE7_CRUISE_MPS 0.16f /* 0=off (pure spin in place). Forward bias
-                                  during MODE7 recovery, and the hard floor
-                                  on BOTH |tl|,|tr|; never below 0.15. */
-#define DISTANCE_KP 1.5f
 #define APP_SCOPE 1       /* 0 text diagnostics; 1 Seekfree CSV scope */
 #define APP_SCOPE_PERIOD_MS 20u /* 50Hz nominal telemetry; control stays 5ms */
 /* State-machine telemetry on the Seekfree scope.
@@ -58,8 +51,7 @@
        w cap, lit count, [gyro rate], state code, R PWM
    4 = course element recognition observer CSV (course_element_test.h)
    5 = COURSE segment diagnostics: segment, pass, element, gap, eight,
-       segment mm, fault, finish  <-- was 3 in the 11-08 framework.
-       Renumbered because 3/4 already mean something in the current project. */
+       segment mm, fault, finish (default). */
 #define APP_SCOPE_STATE 5
 #if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 5
 #error Invalid APP_SCOPE_STATE
@@ -74,26 +66,39 @@
 #if APP_SCOPE_GYRO_CH7 < 0 || APP_SCOPE_GYRO_CH7 > 2
 #error Invalid APP_SCOPE_GYRO_CH7
 #endif
+
+#if APP_SCOPE != 0 && APP_SCOPE != 1
+#error Invalid APP_SCOPE
+#endif
+/* Compile only the measurements needed by the selected output. */
+#define SCOPE_WHEEL_TARGETS (APP_SCOPE && APP_SCOPE_STATE <= 1)
+#define SCOPE_PATTERN (!APP_SCOPE || APP_SCOPE_STATE == 2 || APP_SCOPE_STATE == 3)
+#define SCOPE_STEERING (!APP_SCOPE || APP_SCOPE_STATE == 3)
+#define SCOPE_OBSERVER (APP_SCOPE && APP_SCOPE_STATE == 4)
+
 #define DT 0.005f
 #define PI_F 3.14159265358979f /* TRUE pi: physical dps->rad/s and log conversion ONLY */
-#define TURN_STEP_RAD (PI_F*0.5f*1.01) /* MODE5: target yaw per quarter; tune here for angle bias */
-#define TRACK_HEADING_KP 2.0f /* MODE6 CROSS: own heading-hold gain, independent of MODE4 */
+#define TRACK_HEADING_KP 2.0f /* CROSS and S4 heading hold */
 
 extern struct bmi2_dev bmi270; /* defined in the official dodo_BMI270.c */
 static volatile uint32_t app_ms, app_last_completed;
 static volatile unsigned app_running, app_fault;
 static uint32_t app_last_sample, app_last_log, app_elapsed;
 static uint16_t app_prev_l, app_prev_r, app_mask;
-static int32_t app_counts_l, app_counts_r;
 static float app_s, app_yaw, app_il, app_ir, app_vl, app_vr;
 static float app_error_prev, app_line_prev, app_cmd_l, app_cmd_r;
+#if SCOPE_WHEEL_TARGETS
 static float app_target_l, app_target_r;
+#endif
+#if !APP_SCOPE
+static int32_t app_counts_l, app_counts_r;
+#endif
 static float app_bias, app_bias_sum, app_bias_square, app_gz;
-static unsigned app_cal_samples, app_cal_ready, app_hold, app_quarter;
-static unsigned app_lost, app_settled, app_stall;
+static unsigned app_cal_samples, app_cal_ready;
+static unsigned app_lost, app_stall;
 static int app_imu_init;
 static unsigned app_key_prev=1, app_key_stable=1, app_key_ticks;
-static char app_tx[320]; /* text mode now carries the state-machine tail */
+static char app_tx[320];
 static unsigned app_tx_pos, app_tx_len;
 /* fault:1 init;2 acquisition;3 scheduling;4 calibration/missing parameters;
    5 lost line;6 timeout;7 encoder jump;8 stall. Reset to clear fault. */
@@ -101,7 +106,9 @@ static float app_clip(float x,float lo,float hi){return x<lo?lo:x>hi?hi:x;}
 static void App_Stop(void){
     TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;
     app_il=0;app_ir=0;app_cmd_l=0;app_cmd_r=0;
+#if SCOPE_WHEEL_TARGETS
     app_target_l=0;app_target_r=0;
+#endif
 }
 static void app_fail(unsigned code){App_Stop();app_fault=code;}
 static int32_t app_delta(uint16_t n,uint16_t p){
@@ -151,42 +158,24 @@ static int app_parameters_ok(void){
       EFFECTIVE_TRACK_M>0 && SPEED_KP_L>0 && SPEED_KP_R>0 &&
       SPEED_KI_L>=0 && SPEED_KI_R>=0 && SPEED_FF_L>=0 && SPEED_FF_R>=0 &&
       SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
-      MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
-      MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
-      TURN_TOL_RAD>0 && TURN_STEP_RAD>0 && TRACK_HEADING_KP>0 && LINE_D_MAX>0 &&
-      (MODE7_CRUISE_MPS==0.0f ||
-       (MODE7_CRUISE_MPS>=0.15f && MODE7_CRUISE_MPS<=TEST_SPEED_MPS));
+      MAX_PWM>0 && MAX_PWM<=0.85f && COURSE_SPEED_MAX_MPS>0 && COURSE_SPEED_MAX_MPS<=0.5f &&
+      MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=COURSE_SPEED_MAX_MPS &&
+      TRACK_HEADING_KP>0 && LINE_D_MAX>0;
 }
-/* MODE6 trial settings. Channels 0..11 run from left to right. */
+/* Track sensing and island tuning. Channels 0..11 run left to right. */
 #define TRACK_CRUISE course_cruise()
-/* ---- Constant-speed A/B test -------------------------------------------
-   1: FOLLOW holds TRACK_CRUISE everywhere - no |w| slowdown, no graded
-      bend slowdown, no corner-approach cap. Island (fork/BRANCH 0.22 cap
-      and BRANCH_TURN_V) is deliberately left untouched.
-   0: original coupled chain, see track_control(). */
-#define TRACK_FLAT_SPEED 1
-/* Reserved: right-angle-only cap, independent of the switch above.
-   0=off; fill a positive m/s later to slow corners while the rest of the
-   lap stays at cruise. Uses the same corner test as CORNER_SLOW_MPS. */
-#define TRACK_CORNER_ONLY_MPS 0.0f
 #define ISLAND_SIDE course_side() /* -1 left, +1 right, 0 stop at candidate for inspection */
 #define CENTRAL_TOTAL_MAX 9     /* widest single segment still a normal line (was 6: 7..9 grey band) */
 #define CENTRAL_WEIGHT_MAX 2.0f /* |weighted sum| below this => line is centred */
 #define CORNER_HALF_HITS 6      /* all 6 sensors on one side lit => corner */
-#define CORNER_WEIGHT_MIN 2.5f  /* |weighted sum| above this => one side dominates */
-#define CORNER_DWEIGHT_MIN 1.5f /* jump in weighted sum from last frame => shape change */
 #define CORNER_FRAMES 2         /* opposite-sign frames needed to flip a latched direction */
-#define CORNER_SLOW_MPS 0.30f   /* cruise cap while a corner is being approached */
-#define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 /* ---- Fork / island entry ---- */
-#define FORK_MODE 1           /* 0 legacy both ends; 1 one edge segment + another (real car); 2 any two groups */
 #define FORK_EDGE_MARGIN 2    /* an edge segment starts <=3 or ends >=8 */
 #define FORK_GAP_MIN 2        /* min blank channels between the two groups */
 #define FORK_SEG_MIN 1        /* min width of each group; 1 allows a single lit sensor */
 #define FORK_FRAMES 4         /* consecutive fork frames before entering BRANCH */
 /* Pre-island two-segment frames are still in FOLLOW: hold the line-PD input
    on them so a segment jump cannot slam w for one frame. 0 = off. */
-#define FORK_ENTRY_HOLD 1
 /* Max per-tick change of the line error while the island entry segment is
    being acquired (IS_ARMED). Smooths the pick switch when ISLAND_FORCE_SIDE
    kicks in on the first BRANCH frame; 0 = freeze e for the whole phase. */
@@ -206,78 +195,31 @@ static int app_parameters_ok(void){
 /* A one-sensor island probe cannot meet FORK_HOLD_SEG_MIN, so the sticky
    window never opens on the very first frame the pattern appears. Hold e
    for THAT frame only (5 ms) instead of opening a 100 ms window. 0 = off. */
-#define FORK_HOLD_ONE_LIT 1
-/* ---- Continuous bend handling: weight/total is the line centre, dbend is its
-       per-frame change (width-free), severity drives a graded slowdown. ---- */
-#define BEND_ENABLE 1          /* 0 = fall back to the old weight-only corner test */
-#define BEND_RATE_K 0.8f      /* weight of |dbend| in severity */
-#define BEND_SLOW_K 1.0f      /* graded slowdown strength; 0 = only the old binary cap */
-#define BEND_SEARCH_MIN 0.80f /* severity above this opens the SEARCH window */
-#define BEND_DBEND_MAX 1.0f   /* clamp on a single-frame bend change */
-/* B-tier strategies: both OFF by default, switch on independently. */
-#define BEND_KP_ENABLE 0      /* B-tier 1: gain scheduling */
-#define BEND_KP_K 0.4f        /* strength used when BEND_KP_ENABLE is 1 */
-#define BEND_D_USE_DBEND 0    /* B-tier 2: use dbend instead of de as the D input */
-#define BEND_D_SCALE 200.0f   /* align dbend (per frame) with de (per second) */
-/* BEND_KP_ENABLE can keep severity high on a straight (small oscillation ->
-   dbend -> severity -> bigger kp -> more oscillation), so the car never
-   "returns to line". After a continuous centred line for this long, drop the
-   bend/corner speed caps AND restore kp to LINE_KP (cancel the B1 boost).
-   TRACK_CRUISE/(1+|w|) still decides the speed. 0 = off. */
-#define BEND_STRAIGHT_RELEASE 1
-#define BEND_STRAIGHT_MS 500u
-#define BEND_STRAIGHT_E 0.35f
-/* ---- Direction latching ---- */
-#define SIDE_ENABLE 1         /* fixed: fallback only; modes 0 (off) and 2 (override) removed */
-#define EDGE_LATCH 1          /* 1: hold a latched side until the window dies or SEARCH exits */
+/* Bend severity and corner direction hold. */
+#define BEND_RATE_K 0.8f
+#define BEND_SEARCH_MIN 0.80f
+#define BEND_DBEND_MAX 1.0f
 #define SEARCH_SPIN_W 3.0f   /* spin rate while finding the line */
 #define SEARCH_SPIN_DIR -1    /* +1/-1: flip if SEARCH spins away from the line */
 /* ---- Exit from a special state ---- */
 #define EXIT_FRAMES 3         /* consecutive valid frames before returning to FOLLOW */
-#define SEARCH_EXIT_MODE 1    /* 0 centred only; 1 any single line; 2 line moving toward centre */
-/* Legacy pattern-based BRANCH exit knobs below are no longer referenced at
-   runtime: the island exit is now owned by island_phase (IS_LEAVE). */
-#define BRANCH_EXIT_MODE 1    /* 0 centred only; 1 any line + dwell; 2 + yaw; 3 + distance */
-#define BRANCH_MIN_MS 100u    /* minimum dwell in BRANCH before an exit is allowed */
-#define BRANCH_MIN_YAW 0.50f  /* rad of heading change for BRANCH_EXIT_MODE 2 */
-#define BRANCH_MIN_DIST 0.15f /* metres travelled for BRANCH_EXIT_MODE 3 */
 #define CROSS_TIMEOUT_MS 450u
 #define BRANCH_TIMEOUT_MS 150000u /* must exceed ARMED+TURN_IN+LOOP+TURN_OUT+LEAVE */
 #define SEARCH_TIMEOUT_MS 1100u
-#define BRANCH_NUDGE_MS 100u
 /* ---- Island sub-state machine ---- */
-#define ISLAND_FORCE_SIDE 1    /* 1: lock onto the ISLAND_SIDE segment for the whole island */
-#define ISLAND_OUT_TRIGGER 1   /* 0 time only; 1 second fork->fall; 2 heading; 3 distance */
-#define ISLAND_OUT_YAW 3.00f   /* rad for trigger 2 */
-#define ISLAND_OUT_DIST 0.60f  /* metres for trigger 3 */
 #define ISLAND_OUT_MS 6000u     /* hard fallback: leave LOOP after this */
-/* Entering the island produces TWO two-segment patterns. The first one is
-   the real entry; the second arrives shortly afterwards and must NOT be
-   taken as the exit signal. Ignore every fork while state_ms is below this
-   window (measured from track_enter(BRANCH), same origin as entry_yaw /
-   entry_s). 0 disables blanking entirely. Tune against the scope trace. */
-#define ISLAND_OUT_BLANK_MS 1000u   /* 11-11 current-project value (was 3000u in 11-08) */
+/* Ignore entry forks until this time has elapsed since BRANCH began. */
+#define ISLAND_OUT_BLANK_MS 1000u   /* mask entry forks for the first 1 s */
 #define ISLAND_LEAVE_MS 1500u   /* straight running before returning to FOLLOW */
 #define ISLAND_OUT_DIR -1       /* +1/-1: final turn direction relative to ISLAND_SIDE */
 /* ---- Active island turn ---- */
-#define BRANCH_TURN_ENABLE 1     /* 0 = PD only, no turn pulses */
-#define BRANCH_TURN_TRIGGER 1    /* 0 immediate; 1 wait for groups to fall to 1; 2 distance */
 #define BRANCH_FALL_FRAMES 4     /* consecutive single-group frames needed by trigger 1 */
 #define BRANCH_WAIT_MAX_MS 2000u /* safety: force the entrance turn if no fall-back */
-#define BRANCH_TURN_DIST 0.08f   /* trigger 2: metres from fork detection to the junction */
 #define BRANCH_TURN_MS 100u      /* duration of each turn pulse */
 #define BRANCH_TURN_W 1.2f       /* extra angular rate added on top of the PD output */
 #define BRANCH_TURN_V 0.20f      /* speed cap during a turn */
 #define BRANCH_TURN_DIR (-1)     /* entrance turn: w += DIR*ISLAND_SIDE*W */
-/* ---- Wait for the two-segment pattern to come back before turning in ----
-   The 2->1 fall-back at the entrance is the 0..9 junction fill (ONE wide
-   band), not the island branch. IS_TURN_IN re-enables D and follows that
-   band's centre, whose edges flicker frame to frame -> the head twitch.
-   With this on, IS_ARMED keeps its e slew + dterm=0 while the band is
-   present; the entrance turn starts only once groups>=2 reappears, and the
-   pick is then locked onto the LEFT (ISLAND_SIDE) segment.
-   0 = old behaviour (turn as soon as the fall-back is counted). */
-#define BRANCH_ARM_WAIT_TWO 1
+/* Wait for the split to return after the entrance fall-back. */
 #define BRANCH_TWO_FRAMES 2      /* consecutive 2-segment frames to accept the split */
 #define BRANCH_TWO_MAX_MS 400u   /* after the fall-back, turn anyway if no split */
 /* ---- Exit turn: smaller than the entrance pulse, and follow the RIGHT
@@ -289,227 +231,66 @@ static int app_parameters_ok(void){
 #define ISLAND_OUT_FOLLOW_SIDE course_exit_side() /* +1 right, -1 left, 0 = keep ISLAND_SIDE */
 enum { FOLLOW, CROSS, BRANCH, SEARCH };
 enum { IS_NONE, IS_ARMED, IS_TURN_IN, IS_LOOP, IS_TURN_OUT, IS_LEAVE };
-static int track_state, edge_side, edge_age, fork_frames, clear_frames;
+static int track_state, edge_side, fork_frames, clear_frames;
 static int side_flip_frames, track_d_ready, track_bend_ready;
 static int island_phase, island_fall_frames, island_out_armed;
-static int island_fell, island_two_wait, island_two_frames, island_two_ok;
+static int island_fell, island_two_wait, island_two_frames;
 static unsigned island_fall_ms;
 static unsigned state_ms, island_phase_start;
-/* app_log() cannot see track_control()'s locals; publish pattern flags
-   once per tick so the state trace shows why a transition fired. */
-static int dbg_groups, dbg_total, dbg_fork, dbg_corner, dbg_island_pair;
-static int dbg_one_lit; /* single-lit island probe seen this tick */
-static int fork_hold_tail, fork_release; /* sticky pre-island steering hold */
-static unsigned straight_ms; /* continuous centred-line time (ms) */
-static long dbg_kp_gain; /* kp*100, refreshed on line-following frames only */
-/* Published for app_log(): commanded body speed, angular rate and the w cap
-   actually used this tick (x1000 on the scope / text log). */
+static int fork_hold_tail, fork_release;
+static float entry_yaw, track_bend_prev;
+#if SCOPE_PATTERN
+static int dbg_groups, dbg_total, dbg_fork, dbg_corner;
+#endif
+#if SCOPE_STEERING
 static float dbg_v, dbg_w, dbg_wcap;
-static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
-
-/* Pure observer from the current project: recognises landmark ORDER and the
-   two completed crossings of the same cross. Does NOT drive the car.
-   ELEM_TEST_ENABLE 0 turns every hook into a no-op (see header). */
+#endif
+#if !APP_SCOPE
+static int dbg_island_pair, dbg_one_lit;
+static unsigned straight_ms;
+#define BEND_STRAIGHT_MS 500u
+#define BEND_STRAIGHT_E 0.35f
+#endif
+#if SCOPE_OBSERVER
 #include "course_element_test.h"
+#endif
 
-/* 1: line PD -> yaw-rate PID -> wheel PI
-   2: nonlinear line PD + gyro damping -> wheel PI
-   3: existing line PD -> wheel PI */
-#ifndef TRACK_STEER_MODE
-#define TRACK_STEER_MODE 2
-#endif
-#if TRACK_STEER_MODE < 1 || TRACK_STEER_MODE > 3
-#error Invalid TRACK_STEER_MODE
-#endif
-/* ---- Steering rate cap + right-angle corner A/B (from current project) --
-   steer_line() used to clip w at a hard-coded +/-2.0 rad/s. CORNER_W_TEST
-   raises that cap ONLY on FOLLOW frames where the corner test fires.
-   0 = bit-for-bit the 11-08 framework behaviour. */
+/* Nonlinear line PD, gyro damping and speed-scaled proportional terms. */
 #define STEER_W_LIMIT 20.0f
-#define CORNER_W_TEST 1
-#define CORNER_TEST_W_LIMIT 20.0f
-/* Corner speed test: disable the SEARCH line-loss fallback. 0 = original. */
-#define CORNER_NO_SEARCH 0
-#if CORNER_NO_SEARCH < 0 || CORNER_NO_SEARCH > 1
-#error Invalid CORNER_NO_SEARCH
-#endif
-/* ---- Island entry jitter: ignore the OTHER fork segment (A/B only) -----
-   The 11-11 project forced pick=0 while BRANCH_ARM_WAIT_TWO is active in
-   IS_TURN_IN, i.e. e came from ONE segment only. The merged framework
-   replaced it with ISLAND_SIDE-dependent selection. This is NOT a missed
-   port: S8 is a RIGHT-hand island and the framework's own regression
-   asserts app_line_prev>0 there, so a fixed pick=0 would select the wrong
-   side. Keep the merged behaviour by default; set 1 only to A/B whether
-   the dynamic pick is what shakes the head on island entry. */
-#define ISLAND_ARM_TWO_FIXED_PICK 0
-#if ISLAND_ARM_TWO_FIXED_PICK < 0 || ISLAND_ARM_TWO_FIXED_PICK > 1
-#error Invalid ISLAND_ARM_TWO_FIXED_PICK
-#endif
 #define STEER2_KP2 1.50f
 #define STEER2_GYRO_KD 0.06f
-#define RATE_KP 0.4f
-#define RATE_KI 0.0f
-#define RATE_KD 0.0f
 #define RATE_GYRO_TAU 0.020f
-#define RATE_I_LIMIT 0.5f
-
-/* =====================================================================
-   UNTESTED feed-forward family (2026-11-11), imported verbatim from the
-   current working project. DEFAULT OFF on purpose: the user has NOT tested
-   it yet. To reproduce the current project exactly, set BOTH
-       WFF_ENABLE 1  and  WFF_SCALE_ENABLE 1
-   To A/B, flip just those two; every other macro keeps its own guard.
-   ---------------------------------------------------------------------
-   R = v/|w|. Three branches (no 120-deg band any more):
-     straight / normal bend : w = u_PD * (v_set / v0)
-     corner                 : w = u_PD * (v_set / v0) - K*v_set
-   The FF term is ADDED AFTER scaling, NEVER multiplied (multiplying would
-   turn K*v into K*v^2/v0 and destroy R invariance).
-   v_set is TRACK_CRUISE = course_cruise() here, i.e. the CURRENT SEGMENT's
-   speed, so both the scaling factor and the FF magnitude follow course_map.
-   WFF_SCALE_STRICT 1 scales ONLY the P terms: dterm and gyro damping
-   already carry a factor of v. WFF_ISLAND_SCOPE controls where the corner
-   term is added: 0 = FOLLOW only; 1 = FOLLOW + IS_ARMED/IS_LOOP/IS_LEAVE;
-   2 = FOLLOW + every BRANCH frame. IS_TURN_IN/IS_TURN_OUT keep the original
-   no-FF behaviour.                                                      */
-#define WFF_ENABLE 1
-#if WFF_ENABLE < 0 || WFF_ENABLE > 1
-#error Invalid WFF_ENABLE
-#endif
-#define WFF_MODE 1
-#if WFF_MODE < 1 || WFF_MODE > 2
-#error Invalid WFF_MODE
-#endif
 #define WFF_K 30.0f
 #define WFF_MAX_W 100.0f
-#define WFF_SCALE_ENABLE 1
-#if WFF_SCALE_ENABLE < 0 || WFF_SCALE_ENABLE > 1
-#error Invalid WFF_SCALE_ENABLE
-#endif
-#define WFF_REF_V 0.20f          /* v0: speed at which the PD was calibrated */
-#define WFF_SCALE_STRICT 1       /* 1 = P terms only; 0 = whole PD (A/B) */
-#if WFF_SCALE_STRICT < 0 || WFF_SCALE_STRICT > 1
-#error Invalid WFF_SCALE_STRICT
-#endif
-#define WFF_ISLAND_SCOPE 1      /* 0 / 1 / 2, see above */
-#if WFF_ISLAND_SCOPE < 0 || WFF_ISLAND_SCOPE > 2
-#error Invalid WFF_ISLAND_SCOPE: use 0, 1 or 2
-#endif
-static float steer_gyro, rate_i, rate_prev;
-static int rate_ready;
-static void steer_reset(void){
-    rate_i=0;rate_prev=0;rate_ready=0;steer_gyro=0;
-}
-static float steer_line(float e,float dterm,float kp,int valid_previous,
-                        float wcap,float pscale){
-    (void)pscale; /* unused in TRACK_STEER_MODE 1 / 3 */
-    float desired=app_clip(-(kp*e+LINE_KD*dterm),-wcap,wcap);
-#if TRACK_STEER_MODE == 1
-    if(!valid_previous){rate_i=0;rate_ready=0;}
-    float error=desired-steer_gyro;
-    float derivative=rate_ready?-(steer_gyro-rate_prev)/DT:0;
-    rate_prev=steer_gyro;rate_ready=1;
-    float next=app_clip(rate_i+RATE_KI*error*DT,-RATE_I_LIMIT,RATE_I_LIMIT);
-    /* desired is a nominal kinematic feedforward; PID corrects rate error. */
-    float raw=desired+RATE_KP*error+next+RATE_KD*derivative;
-    float output=app_clip(raw,-wcap,wcap);
-    if(raw==output || (raw>output && error<0) || (raw<output && error>0))rate_i=next;
-    return output;
-#elif TRACK_STEER_MODE == 2
-    /* WFF_SCALE_STRICT: scale ONLY the P terms. dterm = de/DT already
-       carries a factor of v, and the gyro damping settles to ~w which is
-       also ~v; scaling either again would make them ~v^2. MODE7 passes
-       pscale = 1.0f and stays untouched. */
-    return app_clip(-((kp*e+STEER2_KP2*e*fabsf(e))*pscale+LINE_KD*dterm)
-                    -STEER2_GYRO_KD*steer_gyro,-wcap,wcap);
-#else
-    return desired;
-#endif
-}
-/* ---- MODE7: steering test bench ----------------------------------------
-   APP_MODE 7 isolates the steering loop: nudge the body off the line and
-   watch the recovery. The MODE6 state machine, bend slowdown, island logic,
-   SEARCH and the MODE6 wheel speed floor are all bypassed.
-   The car sits still with the motors OFF until |e| exceeds TRIGGER_E; then a
-   short correction run opens, with a common forward bias (MODE7_CRUISE_MPS)
-   keeping both wheels above the speed floor so the differential is a small
-   perturbation on already-moving wheels instead of a deadzone start. The run
-   ends once the line is centred for SETTLE_MS (or after ACTIVE_MAX_MS), and
-   the motors are cut again - so w->0 means STOP, not a minimum turn rate.
-   All three TRACK_STEER_MODE variants are reused unchanged; steer_gyro keeps
-   being updated every tick in app_control(), so the gyro feedback of modes
-   1 and 2 is live.                                                        */
-#define MODE7_W_LIMIT 3.0f    /* cap on |w| (rad/s); current-project value */
-/* MODE7_CRUISE_MPS is defined near the top of the file so
-   app_parameters_ok() can validate it; applied in app_control(). */
-#define MODE7_KICK_PWM 0.0f  /* 0=off. Optional start-up duty floor for tiny
-                                wheel targets. A PWM floor creates a limit
-                                cycle, so leave it off when judging response. */
-#define MODE7_NO_TIMEOUT 1   /* 1: skip the 120 s run timeout while debugging */
-#define MODE7_NO_STALL 1     /* 1: skip stall fault 8 (car is held by hand) */
-#define MODE7_FF_TURN 1      /* 1: SPEED_FF_TURN_L/R (spin load); 0: straight FF */
-/* Sit still with the motors off by default; open a short correction run only
-   when the line is off centre. Hysteresis keeps it from chattering. */
-#define MODE7_TRIGGER_E 0.02f     /* |e| above this starts a correction run */
-#define MODE7_SETTLE_E  0.01f     /* |e| below this for SETTLE_MS ends it */
-#define MODE7_SETTLE_MS 200u      /* ms of centred line before stopping */
-#define MODE7_ACTIVE_MAX_MS 2000u /* hard cap on one run, so the car cannot roll away */
-static float steer_test_e_prev;
-static int steer_test_d_ready;
-static unsigned mode7_active, mode7_steady_ms, mode7_run_ms;
-static void steer_test_control(float *w,float *e_out){
-    int starts[6],ends[6],groups=0,total=0,previous=0;
-    for(int i=0;i<12;i++){
-        int white=MUX_GET_CHANNEL(app_mask,i);
-        if(white){
-            if(!previous)starts[groups++]=i;
-            ends[groups-1]=i;
-            total++;
-        }
-        previous=white;
-    }
-    if(!total){
-        /* The line swept out of the bar: freeze, do not keep turning on a
-           stale error, and do not open a correction run from a lost line. */
-        *w=0;*e_out=0.0f;
-        steer_test_e_prev=0;steer_test_d_ready=0;
-        rate_i=0;rate_prev=0;rate_ready=0;
-        return;
-    }
-    /* Same normalised centre error as MODE6, so LINE_KP/LINE_KD transfer. */
-    int pick=0;float best=10;
-    for(int i=0;i<groups;i++){
-        float c=(starts[i]+ends[i])/11.0f-1.0f;
-        float d=fabsf(c-steer_test_e_prev);
-        if(d<best){pick=i;best=d;}
-    }
-    float e=(starts[pick]+ends[pick])/11.0f-1.0f;
-    *e_out=e;
-    float de=steer_test_d_ready?
-        app_clip((e-steer_test_e_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
-    *w=app_clip(steer_line(e,de,LINE_KP,steer_test_d_ready,MODE7_W_LIMIT,1.0f),
-                -MODE7_W_LIMIT,MODE7_W_LIMIT);
-    steer_test_e_prev=e;steer_test_d_ready=1;
+#define WFF_REF_V 0.20f
+static float steer_gyro;
+
+static float steer_line(float e,float dterm,float pscale){
+    return app_clip(-((LINE_KP*e+STEER2_KP2*e*fabsf(e))*pscale+LINE_KD*dterm)
+                    -STEER2_GYRO_KD*steer_gyro,-STEER_W_LIMIT,STEER_W_LIMIT);
 }
 static void track_enter(int state){
     track_state=state;
     state_ms=0;
     clear_frames=0;
     entry_yaw=app_yaw;
-    entry_s=app_s;
     track_d_ready=0;     /* suppress the D term on the first frame back in FOLLOW */
     track_bend_ready=0;  /* suppress a fake dbend jump on the first frame back */
     island_phase=(state==BRANCH)?IS_ARMED:IS_NONE;
     island_fall_frames=0;island_out_armed=0;island_phase_start=0;
     island_fell=0;island_two_wait=0;island_two_frames=0;
-    island_two_ok=0;island_fall_ms=0;
+    island_fall_ms=0;
 }
-static void track_reset(void){ steer_reset();
+static void track_reset(void){
+    steer_gyro=0;
     track_enter(FOLLOW);
-    edge_side=0; edge_age=100; fork_frames=0;
-    side_flip_frames=0; track_weight_prev=0;
+    edge_side=0; fork_frames=0;
+    side_flip_frames=0;
     track_bend_prev=0; track_bend_ready=0;
-    fork_hold_tail=fork_release=0;straight_ms=0;
+    fork_hold_tail=fork_release=0;
+#if !APP_SCOPE
+    straight_ms=0;
+#endif
 }
 
 /* Course state advances ONLY on a confirmed explicit completion event.
@@ -522,24 +303,20 @@ static unsigned course_straight_ms, course_final, course_done;
 static unsigned course_start_hold; /* launch heading-lock countdown, frames */
 static unsigned course_eight, course_join_armed, course_join_clear, course_join_frames;
 static unsigned course_eight_started;
-static float course_start_s, course_last_event_s, course_gap_s, course_gap_yaw;
-static float course_last_line_yaw, course_finish_s, course_eight_s, course_eight_yaw;
-/* Heading to hold while crossing the S4 gap. COURSE_GAP_TURN_ENABLE 0 keeps
-   the 11-08 behaviour (hold the entry heading = drive straight); 1 turns the
-   car RIGHT by COURSE_GAP_TURN_RAD as soon as the line is lost, then holds
-   that new heading until the line is reacquired. */
+static float course_start_s, course_last_event_s, course_gap_s;
+static float course_last_line_yaw, course_eight_s, course_eight_yaw;
+/* Heading target after the S4 right turn. */
 static float course_gap_target_yaw;
 static const CourseSegment *course_spec(void){return &course_map[course_segment-1u];}
 static float course_cruise(void){
-    return COURSE_ENABLE && APP_MODE==6 ? fminf(TEST_SPEED_MPS,course_spec()->speed):TEST_SPEED_MPS;
+    return fminf(COURSE_SPEED_MAX_MPS,course_spec()->speed);
 }
 static int course_side(void){
-    if(!COURSE_ENABLE || APP_MODE!=6)return -1;
     return course_eight==EIGHT_SMALL ? EIGHT_SMALL_SIDE:course_spec()->island_side;
 }
-static int course_exit_side(void){return COURSE_ENABLE && APP_MODE==6?course_spec()->exit_side:1;}
+static int course_exit_side(void){return course_spec()->exit_side;}
 static int course_accept(void){
-    return !COURSE_ENABLE || (course_armed && !course_start_hold);
+    return course_armed && !course_start_hold;
 }
 static void course_begin(void){
     course_segment=COURSE_START_SEGMENT;course_pass=course_pending=0;
@@ -547,27 +324,24 @@ static void course_begin(void){
     course_start_s=app_s;course_last_event_s=app_s;
     course_gap=course_gap_done=course_gap_seen=course_straight_ms=0;
     course_final=course_done=0;course_eight=EIGHT_OFF;
-    course_start_hold=(COURSE_START_HOLD_ENABLE?COURSE_START_HOLD_FRAMES:0u);
+    course_start_hold=COURSE_START_HOLD_FRAMES;
     course_join_armed=course_join_clear=course_join_frames=0;
-    if(!COURSE_ENABLE || APP_MODE!=6)return;
     if(course_segment<1 || course_segment>10 || COURSE_GAP_SPEED<=0 ||
-       COURSE_GAP_MAX_M<=COURSE_GAP_MIN_M || course_map[S10].finish_after_last_bar_m<=COURSE_FINISH_COAST_M ||
+       COURSE_GAP_MAX_M<=COURSE_GAP_MIN_M ||
        COURSE_GAP_TURN_RAD<0.0f || COURSE_GAP_TURN_RAD>1.0f ||
        COURSE_GAP_TURN_W<=0.0f ||
-       COURSE_FINISH_BAR_SPEED<=0.0f || COURSE_FINISH_BAR_SPEED>TEST_SPEED_MPS ||
-       (COURSE_GAP_TURN_DIR!=1 && COURSE_GAP_TURN_DIR!=-1) ||
-       ISLAND_OUT_TRIGGER!=1){
+       COURSE_FINISH_BAR_SPEED<=0.0f || COURSE_FINISH_BAR_SPEED>COURSE_SPEED_MAX_MPS ||
+       (COURSE_GAP_TURN_DIR!=1 && COURSE_GAP_TURN_DIR!=-1)){
         app_fail(13);return;
     }
     for(unsigned i=0;i<10;i++)
-        if(course_map[i].speed<=0 || course_map[i].speed>TEST_SPEED_MPS ||
+        if(course_map[i].speed<=0 || course_map[i].speed>COURSE_SPEED_MAX_MPS ||
            !course_map[i].passes || abs(course_map[i].island_side)!=1 ||
            (course_map[i].checkpoint!=CP_CROSS && course_map[i].checkpoint!=CP_ISLAND)){
             app_fail(13);return;
         }
 }
 static void course_enter_element(unsigned type){
-    if(!COURSE_ENABLE || APP_MODE!=6)return;
     if(course_final || type!=course_spec()->checkpoint){app_fail(9);return;}
     if(type==CP_ISLAND && course_spec()->eight){
         course_eight=EIGHT_LARGE_IN;course_eight_s=app_s;course_eight_yaw=app_yaw;
@@ -576,7 +350,6 @@ static void course_enter_element(unsigned type){
     }
 }
 static void course_complete(unsigned type){
-    if(!COURSE_ENABLE || APP_MODE!=6)return;
     if(type!=course_spec()->checkpoint || !course_armed || course_pending){app_fail(9);return;}
     /* Gap must actually have been crossed, not silently skipped. */
     if(course_spec()->gap && !course_gap_done){app_fail(9);return;}
@@ -584,13 +357,12 @@ static void course_complete(unsigned type){
     course_pending=type;
 }
 static void course_tick(void){
-    if(!COURSE_ENABLE)return;
     if(course_start_hold)course_start_hold--;
     if(course_pending){
         course_pending=0;course_pass++;
         course_last_event_s=app_s;course_armed=0;course_clear_ms=0;
         if(course_pass>=course_spec()->passes){
-            if(course_segment==10){course_final=1;course_finish_s=app_s;}
+            if(course_segment==S10+1u)course_final=1;
             else{
                 course_segment++;course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
@@ -603,7 +375,6 @@ static void course_tick(void){
 /* No global lost-line grace extension. ONLY an armed S4 straight may bridge
    a blank, with a fixed yaw reference and independent distance/time bounds. */
 static int course_gap_control(int total,int groups,float bend,float *v,float *w){
-    if(!COURSE_ENABLE)return 0;
     if(!course_gap && track_state==FOLLOW){
         if(total && groups==1 && fabsf(bend)<=COURSE_GAP_E_MAX &&
            fabsf(steer_gyro)<=COURSE_GAP_GYRO_MAX){
@@ -613,13 +384,12 @@ static int course_gap_control(int total,int groups,float bend,float *v,float *w)
         if(!total && course_spec()->gap && !course_gap_done &&
            course_straight_ms>=COURSE_GAP_APPROACH_MS &&
            s>=course_spec()->gap_arm_min_m && s<=course_spec()->gap_arm_max_m){
-            course_gap=1;course_gap_s=app_s;course_gap_yaw=course_last_line_yaw;
+            course_gap=1;course_gap_s=app_s;
             course_gap_started=app_elapsed;course_gap_seen=0;
             /* Yaw grows counter-clockwise (gyro z, GYRO_SIGN 1), so a RIGHT
                turn SUBTRACTS the angle. Flip COURSE_GAP_TURN_DIR to turn left. */
-            course_gap_target_yaw=course_gap_yaw-
-                (float)COURSE_GAP_TURN_DIR*COURSE_GAP_TURN_RAD*
-                (float)(COURSE_GAP_TURN_ENABLE);
+            course_gap_target_yaw=course_last_line_yaw-
+                (float)COURSE_GAP_TURN_DIR*COURSE_GAP_TURN_RAD;
         }
     }
     if(!course_gap)return 0;
@@ -636,26 +406,17 @@ static int course_gap_control(int total,int groups,float bend,float *v,float *w)
     if(course_gap_seen>=COURSE_GAP_REACQUIRE_MS){
         if(d<COURSE_GAP_MIN_M){app_fail(10);*v=*w=0;return 1;}
         course_gap=0;course_gap_done=1;course_straight_ms=0;
-        track_enter(FOLLOW);edge_age=100;edge_side=0;
+        track_enter(FOLLOW);edge_side=0;
         app_error_prev=app_line_prev=bend;fork_frames=0;fork_hold_tail=fork_release=0;
-        rate_i=0;rate_ready=0;
         return 0;
     }
     *v=fminf(course_cruise(),COURSE_GAP_SPEED);
-    /* Heading hold towards course_gap_target_yaw. With TURN_ENABLE 1 the
-       target is offset to the RIGHT, so the car immediately rotates by that
-       angle and then runs straight along the new heading (the P loop drives
-       w -> 0 once the angle is reached). With TURN_ENABLE 0 the target is
-       the entry heading, i.e. exactly the 11-08 "hold heading" behaviour.
-       A/B is bit-for-bit at TURN_ENABLE 0. */
-    float gap_wcap=(float)(COURSE_GAP_TURN_ENABLE?
-        COURSE_GAP_TURN_W:COURSE_GAP_W_MAX);
+    float gap_wcap=COURSE_GAP_TURN_W;
     *w=app_clip(TRACK_HEADING_KP*(course_gap_target_yaw-app_yaw),
                 -gap_wcap,gap_wcap);
     track_d_ready=0;return 1;
 }
 static void course_observe(int groups,int total,int fork,int wide){
-    if(!COURSE_ENABLE)return;
     if(!course_armed && !course_final){
         if(track_state==FOLLOW && groups==1 && total>0 && !wide && !fork)
             course_clear_ms+=5;
@@ -668,7 +429,7 @@ static void course_observe(int groups,int total,int fork,int wide){
    A fresh fork after a released window + leg distance + yaw identifies the
    shared junction. Any guard failure stops instead of silently exiting early. */
 static void course_eight_update(int fork){
-    if(!COURSE_ENABLE || !course_spec()->eight || track_state!=BRANCH || island_phase!=IS_LOOP)return;
+    if(!course_spec()->eight || track_state!=BRANCH || island_phase!=IS_LOOP)return;
     float d=app_s-course_eight_s, a=fabsf(app_yaw-course_eight_yaw);
     if(d>EIGHT_STAGE_MAX_M || app_elapsed-course_eight_started>EIGHT_STAGE_MAX_MS){app_fail(11);return;}
     if(course_eight==EIGHT_LARGE_OUT)return;
@@ -686,39 +447,26 @@ static void course_eight_update(int fork){
         course_eight++;
         course_eight_s=app_s;course_eight_yaw=app_yaw;course_eight_started=app_elapsed;
         course_join_frames=course_join_armed=course_join_clear=0;
-        island_out_armed=0;track_d_ready=0;rate_i=0;rate_ready=0;
+        island_out_armed=0;track_d_ready=0;
         /* Pick the new side immediately in LOOP; keep optical feedback active.
            No timed blind rotation and no synthetic 'island complete'. */
         app_error_prev=app_line_prev=(float)course_side()*0.5f;
     }
 }
 static int course_eight_can_exit(void){
-    return !COURSE_ENABLE || !course_spec()->eight ||
+    return !course_spec()->eight ||
         (course_eight==EIGHT_LARGE_OUT && app_s-course_eight_s>=EIGHT_RETURN_MIN_M);
 }
 static void course_limit(float *v,float *w){
-    if(!COURSE_ENABLE)return;
-#if !COURSE_FINISH_BAR_ENABLE
-    if(course_final){
-        float left=course_spec()->finish_after_last_bar_m-(app_s-course_finish_s);
-        if(left<=COURSE_FINISH_COAST_M){course_done=1;App_Stop();*v=*w=0;return;}
-        float cap=left<COURSE_FINISH_BRAKE_M?MIN_SPEED_MPS:COURSE_FINISH_SPEED;
-        if(*v>0)*v=fminf(*v,cap);
-    }
-#endif
     if(*v>0)*v=fminf(*v,course_cruise());
     /* Preserve the direction of line reacquisition but drive an arc. The old
        SEARCH had v=0 and spun in place; all course-mode turns stay forward. */
     if(track_state==SEARCH){*v=course_cruise();}
-#if COURSE_FINISH_BAR_ENABLE
-    /* S10 is the only segment with a finish distance. Both finish bars are
-       ordinary CROSS events: course_pass counts them. First -> slow down,
-       second (course_final set by course_tick) -> stop immediately. */
-    if(course_spec()->finish_after_last_bar_m>0.0f){
+    /* Slow after the first finish bar; stop after the final bar. */
+    if(course_segment==S10+1u){
         if(course_final){course_done=1;App_Stop();*v=*w=0;return;}
         if(course_pass>=1 && *v>0)*v=fminf(*v,COURSE_FINISH_BAR_SPEED);
     }
-#endif
     if(*v>0)*w=app_clip(*w,-1.8f*(*v)/EFFECTIVE_TRACK_M,1.8f*(*v)/EFFECTIVE_TRACK_M);
     /* Launch: the car sits ON the start cross. Hold a straight heading for a
        few frames so the bar pattern cannot kick the steering loop. */
@@ -743,18 +491,15 @@ static void track_control(float *v,float *w){
         }
         previous=white;
     }
-    float dweight=weight-track_weight_prev;
-    float prev_abs=fabsf(track_weight_prev);
-    track_weight_prev=weight; /* update before any early return */
     /* weight/total == segment centre e for one run; dbend is its per-frame
        change, free of line-width changes. Kept before every early return so
        a state switch cannot fake a jump on the frame we come back. */
     float bend=total?weight/(float)total:0.0f;
-    float dbend=(BEND_ENABLE && track_bend_ready)?
+    float dbend=track_bend_ready?
         app_clip(bend-track_bend_prev,-BEND_DBEND_MAX,BEND_DBEND_MAX):0.0f;
     track_bend_prev=bend;
     track_bend_ready=1;
-    float severity=BEND_ENABLE?(fabsf(bend)+BEND_RATE_K*fabsf(dbend)):0.0f;
+    float severity=fabsf(bend)+BEND_RATE_K*fabsf(dbend);
     int wide=(groups==1 && total>=12);
     if(course_gap_control(total,groups,bend,v,w))return;
     /* Real island entry: ONE segment probes in from an edge, the other is the
@@ -769,27 +514,13 @@ static void track_control(float *v,float *w){
         int near_left=(starts[0]<=FORK_EDGE_MARGIN);
         int near_right=(ends[last]>=11-FORK_EDGE_MARGIN);
         int shape=(gap>=FORK_GAP_MIN && w0>=FORK_SEG_MIN && wN>=FORK_SEG_MIN);
-        /* Structural sharp-corner test: 5+ lit sensors on ONE HALF of the
-           bar (ch0-5 or ch6-11). An island entry is two narrow runs, so a
-           wide CENTRAL straight segment (grey band, up to 9 lit) never
-           reaches 5 on one half and is deliberately NOT vetoed. */
+        /* A fully lit half-bar indicates a corner, not a fork. */
         int corner_lit=0;
         if(FORK_CORNER_LIT_MIN>0){
             if(left_hits>=FORK_CORNER_LIT_MIN ||
                right_hits>=FORK_CORNER_LIT_MIN)corner_lit=1;
         }
-        /* FORK_MODE kept as a 3-way selector: the real-car one-edge test (1)
-           has NOT been validated on the car yet, so 0/2 stay available for
-           A/B comparison during the island test sequence. */
-        if(FORK_MODE==0)
-            fork=(starts[0]==0 && ends[0]>=1 &&
-                  ends[last]==11 && starts[last]<=10);
-        else if(FORK_MODE==1)
-            fork=shape && (near_left || near_right);
-        else
-            fork=shape;
-        /* Veto applies to ALL FORK_MODE variants, so a sharp corner cannot
-           be mistaken for an island entrance regardless of the A/B setting. */
+        fork=shape && (near_left || near_right);
         if(corner_lit)fork=0;
         /* Narrow edge probe = real island entry. A wide probe, one whole side
            lit, or the full bar means a sharp corner: never open the hold. */
@@ -801,37 +532,29 @@ static void track_control(float *v,float *w){
         island_pair=fork && probe_narrow && !corner_wide;
         /* One-lit probe: fork is valid but probe_narrow fails, so no sticky
            window. Flag it for a single-frame hold in the e stage below. */
-        one_lit_probe=(FORK_HOLD_ONE_LIT && fork && !corner_wide &&
+        one_lit_probe=(fork && !corner_wide &&
             ((near_left && w0==1) || (near_right && wN==1)));
     }
-    dbg_island_pair=island_pair;
-    dbg_one_lit=one_lit_probe;
     int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
                  fabsf(weight)<CENTRAL_WEIGHT_MAX);
-    /* Severity drives the graded slowdown for EVERY bend; this boolean only
-       opens the SEARCH window, i.e. the extreme end of the same scale. The
-       one-side-all-lit test stays as a hard backstop. */
-    int corner=!wide && !fork && (BEND_ENABLE ?
+    int corner=!wide && !fork &&
         (severity>=BEND_SEARCH_MIN || left_hits>=CORNER_HALF_HITS ||
-         right_hits>=CORNER_HALF_HITS) :
-        (left_hits>=CORNER_HALF_HITS || right_hits>=CORNER_HALF_HITS ||
-         fabsf(weight)>=CORNER_WEIGHT_MIN || fabsf(dweight)>=CORNER_DWEIGHT_MIN));
-    /* Publish before every early return below, so all control paths in
-       this tick report the same fresh pattern snapshot to app_log(). */
+         right_hits>=CORNER_HALF_HITS);
+#if SCOPE_PATTERN
     dbg_groups=groups;dbg_total=total;dbg_fork=fork;dbg_corner=corner;
-    /* Current-project element recognition observer (no drive, pure CSV). */
+#endif
+#if !APP_SCOPE
+    dbg_island_pair=island_pair;
+    dbg_one_lit=one_lit_probe;
+    if(track_state==FOLLOW && groups==1 && total>0 &&
+       total<=CENTRAL_TOTAL_MAX && fabsf(bend)<BEND_STRAIGHT_E){
+        if(straight_ms<BEND_STRAIGHT_MS+5u)straight_ms+=5;
+    }else straight_ms=0;
+#endif
+#if SCOPE_OBSERVER
     elem_test_observe(track_state==BRANCH,track_state==CROSS,
         island_phase==IS_LEAVE,wide,fork,groups,total,5u);
-    /* Straight detector uses bend (the width-free line centre), NOT severity:
-       with BEND_KP on, severity can stay artificially high on a straight,
-       which is exactly the loop we want to break. */
-    if(BEND_STRAIGHT_RELEASE){
-        int straight_like=(groups==1 && total>0 &&
-            total<=CENTRAL_TOTAL_MAX && fabsf(bend)<BEND_STRAIGHT_E);
-        if(straight_like && track_state==FOLLOW){
-            if(straight_ms<BEND_STRAIGHT_MS+5u)straight_ms+=5;
-        }else straight_ms=0;
-    }else straight_ms=0;
+#endif
     int corner_side=(fabsf(weight)>0.01f)?(weight>0.0f?1:-1):
                     (right_hits>=left_hits?1:-1);
     int side=0;
@@ -839,15 +562,14 @@ static void track_control(float *v,float *w){
         if(ends[0]<=3) side=-1;
         if(starts[0]>=8) side=1;
     }
-    if(edge_age<100) edge_age++;
     course_observe(groups,total,fork,wide);
     if(track_state==FOLLOW){
         if(corner){
             /* One frame is enough to open the window and latch a direction:
                a gradual bend may show an edge pattern for only one frame.
                Once latched, a flip needs CORNER_FRAMES consistent frames. */
-            edge_age=0;
-            if(!EDGE_LATCH || !edge_side){
+
+            if(!edge_side){
                 edge_side=corner_side;side_flip_frames=0;
             }else if(corner_side!=edge_side){
                 if(++side_flip_frames>=CORNER_FRAMES){
@@ -855,17 +577,14 @@ static void track_control(float *v,float *w){
                 }
             }else side_flip_frames=0;
         }else side_flip_frames=0;
-        /* Legacy single-frame shortcut. Default OFF: it used to overwrite the
-           corner direction and could reverse the turn right before line loss. */
-        if(SIDE_ENABLE && side && !corner && !edge_side){edge_side=side;edge_age=0;}
+        /* Use an edge hint only if no corner direction is latched. */
+        if(side && !corner && !edge_side){edge_side=side;}
         fork_frames=fork ? fork_frames+1 : 0;
         /* Sticky window keyed on the narrow island probe, NOT on raw fork or
            groups: both flicker as the probe enters the bar, and a per-frame
            hold toggling with them is what shook the head. */
-        if(FORK_ENTRY_HOLD){
-            if(island_pair){fork_hold_tail=FORK_HOLD_TAIL;fork_release=FORK_HOLD_RELEASE;}
-            else if(fork_hold_tail>0)fork_hold_tail--;
-        }
+        if(island_pair){fork_hold_tail=FORK_HOLD_TAIL;fork_release=FORK_HOLD_RELEASE;}
+        else if(fork_hold_tail>0)fork_hold_tail--;
         if(wide && course_accept()){
             course_enter_element(CP_CROSS);if(!app_running)return;
             track_enter(CROSS);
@@ -876,23 +595,10 @@ static void track_control(float *v,float *w){
             if(!ISLAND_SIDE){app_fail(5);return;}
             course_enter_element(CP_ISLAND);if(!app_running)return;
             track_enter(BRANCH);
-#if !CORNER_NO_SEARCH
-#if COURSE_LOSS_SEARCH_ENABLE
-        /* Any lost line outside the S4 gap must keep looking. The old
-           condition demanded a fresh latched edge (edge_age<=24 && edge_side),
-           which a mid-bar straight or a right-angle overshoot often lacks,
-           so the car stopped with F5 instead of searching. */
         }else if(!total){
             if(!edge_side)edge_side=COURSE_LOSS_SEARCH_DIR;
-            edge_age=0;
             track_enter(SEARCH);
         }
-#else
-        }else if(!total && edge_age<=24 && edge_side) track_enter(SEARCH);
-#endif
-#else
-        }   /* CORNER_NO_SEARCH: no recovery spin; a lost line stops the car */
-#endif
     }
     if(track_state!=FOLLOW)state_ms+=5;
     /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
@@ -901,36 +607,17 @@ static void track_control(float *v,float *w){
     if(track_state==BRANCH){
         unsigned ph_ms=state_ms-island_phase_start;
         if(island_phase==IS_ARMED){
-            int trigger=0,hard=0;
-            if(BRANCH_TURN_TRIGGER==0)trigger=1;
-            else if(BRANCH_TURN_TRIGGER==1){
-                if(groups==1)island_fall_frames++;
-                else island_fall_frames=0;
-                int fall_now=(island_fall_frames>=BRANCH_FALL_FRAMES);
-                /* Latch the fall-back: while crossing the 0..9 junction
-                   fill the group count flickers 1<->2, and the two-segment
-                   wait must not restart on every flicker. With the switch
-                   off this is bit-for-bit the old per-frame test. */
-                if(BRANCH_ARM_WAIT_TWO && fall_now)island_fell=1;
-                trigger=BRANCH_ARM_WAIT_TWO?(int)island_fell:fall_now;
-            }else if(BRANCH_TURN_TRIGGER==2)
-                trigger=(app_s-entry_s>=BRANCH_TURN_DIST);
-            if((int)state_ms>=(int)BRANCH_WAIT_MAX_MS){
+            if(groups==1)island_fall_frames++;
+            else island_fall_frames=0;
+            if(island_fall_frames>=BRANCH_FALL_FRAMES)island_fell=1;
+            int trigger=island_fell;
+            int hard=0;
+            if(state_ms>=BRANCH_WAIT_MAX_MS){
                 trigger=1;
-                /* WAIT_MAX is the "no fall-back at all" deadline. Once the
-                   fall-back has been seen, BRANCH_TWO_MAX_MS owns the split
-                   wait; do not cut that wait short here. */
-                hard=!(BRANCH_ARM_WAIT_TWO && BRANCH_TURN_TRIGGER==1 &&
-                       island_fell);
+                hard=!island_fell;
             }
-            /* New decision: a single wide band is NOT the island branch.
-               Stay in IS_ARMED (e slew + dterm=0, so a flickering band
-               cannot kick w) until two segments reappear, then start the
-               entrance turn with a forced LEFT pick. Two timeouts keep the
-               old blind turn available: BRANCH_TWO_MAX_MS is measured from
-               the fall-back, BRANCH_WAIT_MAX_MS from track_enter(BRANCH). */
-            if(BRANCH_ARM_WAIT_TWO && BRANCH_TURN_TRIGGER==1 &&
-               trigger && !hard){
+            /* After the first fall to one group, wait for two groups again. */
+            if(trigger && !hard){
                 if(groups>=2){
                     if(island_two_frames<BRANCH_TWO_FRAMES)
                         island_two_frames++;
@@ -943,7 +630,6 @@ static void track_control(float *v,float *w){
                 int split_ok=(island_two_frames>=BRANCH_TWO_FRAMES);
                 int split_timeout=(island_two_wait &&
                     (int)(state_ms-island_fall_ms)>=(int)BRANCH_TWO_MAX_MS);
-                if(split_ok)island_two_ok=1;
                 trigger=(split_ok||split_timeout);
             }
             if(trigger){
@@ -955,34 +641,12 @@ static void track_control(float *v,float *w){
         }else if(island_phase==IS_LOOP){
             course_eight_update(fork);if(!app_running)return;
             int out=0;
-            if(ISLAND_OUT_TRIGGER==1){
-                /* The second fork of the entry pair is not an exit cue. */
-                if(fork && (int)state_ms>=(int)ISLAND_OUT_BLANK_MS)
-                    island_out_armed=1;
-                else if(island_out_armed && groups==1)out=1;
-            }else if(ISLAND_OUT_TRIGGER==2)
-                out=(fabsf(app_yaw-entry_yaw)>=ISLAND_OUT_YAW);
-            else if(ISLAND_OUT_TRIGGER==3)
-                out=((app_s-entry_s)>=ISLAND_OUT_DIST);
-            /* For trigger 1 the fallback timer starts at the END of the
-               blanking window. Otherwise the old 600 ms cap fires while
-               fork is still blanked and bypasses the whole window. Other
-               triggers keep their original phase-relative timing. */
-            unsigned fallback_ms=ph_ms;
-            if(ISLAND_OUT_TRIGGER==1 && ISLAND_OUT_BLANK_MS>0u)
-                fallback_ms=((int)state_ms>=(int)ISLAND_OUT_BLANK_MS)?
-                    (unsigned)((int)state_ms-(int)ISLAND_OUT_BLANK_MS):0u;
-            if((int)fallback_ms>=(int)ISLAND_OUT_MS && !out){
-                if(COURSE_ENABLE){
-                    /* Eight uses its per-leg timeout; never turn a timeout
-                       into a valid checkpoint completion. */
-                    if(!course_spec()->eight){app_fail(12);return;}
-                }else out=1;
-            }
+            if(fork && state_ms>=ISLAND_OUT_BLANK_MS)
+                island_out_armed=1;
+            else if(island_out_armed && groups==1)out=1;
+            if(state_ms>=ISLAND_OUT_BLANK_MS+ISLAND_OUT_MS && !out &&
+               !course_spec()->eight){app_fail(12);return;}
             if(!course_eight_can_exit()){out=0;island_out_armed=0;}
-            /* A fallback timer is not a confirmed eight exit landmark. */
-            if(COURSE_ENABLE && course_spec()->eight && out &&
-               !(island_out_armed && groups==1)){app_fail(11);return;}
             if(out){island_phase=IS_TURN_OUT;island_phase_start=state_ms;}
         }else if(island_phase==IS_TURN_OUT){
             if((int)ph_ms>=(int)ISLAND_TURN_OUT_MS){island_phase=IS_LEAVE;island_phase_start=state_ms;}
@@ -990,7 +654,7 @@ static void track_control(float *v,float *w){
             if((int)ph_ms>=(int)ISLAND_LEAVE_MS){
                 course_complete(CP_ISLAND);if(!app_running)return;
                 track_enter(FOLLOW);
-                edge_age=100;edge_side=0;
+                edge_side=0;
                 /* Back in FOLLOW the first pick is driven by app_line_prev.
                    Seed it with the SAME side used during the exit, otherwise
                    the very first frame snaps back to the wrong segment. */
@@ -1011,8 +675,7 @@ static void track_control(float *v,float *w){
         int seen=(groups==1 && total>0 && total<=CENTRAL_TOTAL_MAX);
         int exit_ok;
         if(track_state==SEARCH){
-            exit_ok=(SEARCH_EXIT_MODE==0)?central:seen;
-            if(SEARCH_EXIT_MODE==2)exit_ok=exit_ok && fabsf(weight)<prev_abs;
+            exit_ok=seen;
         }else if(track_state==BRANCH){
             /* The island exit is owned by island_phase (IS_LEAVE), not by a
                pattern test: two-segment patterns reappear during the final
@@ -1023,7 +686,7 @@ static void track_control(float *v,float *w){
         if(clear_frames>=EXIT_FRAMES){
             if(track_state==CROSS){course_complete(CP_CROSS);if(!app_running)return;}
             track_enter(FOLLOW);
-            edge_age=100;edge_side=0;
+            edge_side=0;
             /* Reset BOTH references: a stale app_line_prev would make the first
                post-exit frame pick a segment near the pre-state line position. */
             app_error_prev=app_line_prev=(starts[0]+ends[0])/11.0f-1.0f;
@@ -1034,15 +697,12 @@ static void track_control(float *v,float *w){
         *v=0; *w=SEARCH_SPIN_DIR*edge_side*SEARCH_SPIN_W; return;
     }
     if(track_state==CROSS){
-        if(state_ms>CROSS_TIMEOUT_MS){if(COURSE_ENABLE){app_fail(12);return;}if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
+        if(state_ms>CROSS_TIMEOUT_MS){app_fail(12);return;}
         *v=fminf(TRACK_CRUISE,0.30f);
         *w=app_clip(TRACK_HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
         return;
     }
-    if(track_state==BRANCH && state_ms>BRANCH_TIMEOUT_MS){
-        if(COURSE_ENABLE){app_fail(12);return;}
-        if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;
-    }
+    if(track_state==BRANCH && state_ms>BRANCH_TIMEOUT_MS){app_fail(12);return;}
     if(!total){
         track_d_ready=0; /* next line frame must not differentiate across the gap */
         if(track_state==BRANCH){
@@ -1065,13 +725,8 @@ static void track_control(float *v,float *w){
         float dist=fabsf((starts[i]+ends[i])/11.0f-1.0f-app_line_prev);
         if(dist<best){pick=i;best=dist;}
     }
-    /* IS_ARMED keeps FOLLOW's nearest-segment pick. Forcing ISLAND_SIDE here
-       yanks e from the straight segment to the edge probe (1.36 apart) and
-       FORK_E_SLEW drags that switch into a ~136 ms steering swing. Single
-       segments pick index 0 either way, so only two-segment frames differ.
-       IS_LOOP / IS_TURN_OUT / IS_LEAVE still get the forced side. */
-    if(track_state==BRANCH && ISLAND_FORCE_SIDE &&
-       island_phase!=IS_ARMED){
+    /* During ARMED use the nearest segment; then select by entry/exit side. */
+    if(track_state==BRANCH && island_phase!=IS_ARMED){
         /* Exiting: the two-segment pattern reappears during the final turn
            and the RIGHT segment is the one leading out. Follow it through
            IS_TURN_OUT + IS_LEAVE instead of the entry-side segment. */
@@ -1084,50 +739,13 @@ static void track_control(float *v,float *w){
             side=ISLAND_OUT_FOLLOW_SIDE;
         pick=side<0 ? 0 : groups-1;
     }
-    /* New entry decision: once the two-segment pattern is confirmed, the
-       LEFT segment is the island branch. Force it for the entrance turn
-       independently of ISLAND_FORCE_SIDE so this A/B switch stands alone.
-       A single segment is already pick=0, and TURN_OUT/LEAVE are untouched. */
-    if(BRANCH_ARM_WAIT_TWO && island_two_ok && groups>=2 &&
-       track_state==BRANCH && island_phase==IS_TURN_IN){
-#if ISLAND_ARM_TWO_FIXED_PICK
-        pick=0; /* ignore the other fork segment: 11-11 anti-jitter behaviour */
-#else
-        pick=ISLAND_SIDE<0?0:groups-1;
-#endif
-    }
     float e=(starts[pick]+ends[pick])/11.0f-1.0f;
-    /* A two-segment pattern shows up a few frames BEFORE FORK_FRAMES confirms
-       the island entry. Those frames are still FOLLOW, where ISLAND_FORCE_SIDE
-       does not apply and pick can jump to an edge segment: e ~ +/-1, de
-       clamped to LINE_D_MAX, and w slams to its +/-2 limit for one frame.
-       Hold the previous steering input on those frames; the window is only a
-       few ticks and BRANCH takes over as soon as FORK_FRAMES is met. */
-    /* Sticky, island-only hold. Sharp-corner patterns have a wide probe and
-       never open the window, so they keep their normal PD response. */
-    int in_window=(FORK_ENTRY_HOLD && track_state==FOLLOW && fork_hold_tail>0);
-    /* A single-lit edge probe never opens the sticky window. Hold e for
-       THIS frame only: no 100 ms window (corners stay responsive), no
-       release counter, no slew. Suppressed while a window/release is active
-       so the existing sticky behaviour is not disturbed. */
-    int one_lit_hold=(FORK_ENTRY_HOLD && FORK_HOLD_ONE_LIT &&
-                      track_state==FOLLOW && one_lit_probe &&
+    /* Hold and slew the steering error during fork acquisition. */
+    int in_window=(track_state==FOLLOW && fork_hold_tail>0);
+    int one_lit_hold=(track_state==FOLLOW && one_lit_probe &&
                       !in_window && fork_release==0);
-    /* On the frame track_enter(BRANCH) fires, ISLAND_FORCE_SIDE suddenly
-       forces pick onto the ISLAND_SIDE segment and track_d_ready is cleared.
-       Slew e through the whole IS_ARMED phase instead of switching abruptly.
-       BRANCH_ARM_WAIT_TWO below extends that slew into IS_TURN_IN as well. */
-    /* With BRANCH_ARM_WAIT_TWO the wide junction band is still present
-       while IS_ARMED waits, and can briefly reappear inside IS_TURN_IN.
-       Keep the e slew (and dterm=0 below) through TURN_IN too, so no
-       single-frame band edge change can kick w. FORK_E_SLEW==0 freezes e,
-       so in that case the TURN_IN extension is disabled. With the switch
-       off this collapses to the old IS_ARMED-only condition. */
-    int armed_slew=(FORK_ENTRY_HOLD||BRANCH_ARM_WAIT_TWO)&&
-                   island_phase==IS_ARMED;
-    int turn_in_slew=(BRANCH_ARM_WAIT_TWO && FORK_E_SLEW>0.0f &&
-                      island_phase==IS_TURN_IN);
-    int entry_slew=(track_state==BRANCH&&(armed_slew||turn_in_slew));
+    int entry_slew=(track_state==BRANCH &&
+        (island_phase==IS_ARMED || (FORK_E_SLEW>0.0f && island_phase==IS_TURN_IN)));
     if(in_window){e=app_error_prev;fork_release=FORK_HOLD_RELEASE;}
     else if(one_lit_hold)e=app_error_prev;
     else if(track_state==FOLLOW && fork_release>0){
@@ -1140,91 +758,24 @@ static void track_control(float *v,float *w){
        after a lost line / state switch a stale e divided by DT would kick w
        to its limit. LINE_D_MAX caps the remaining single-frame jumps. */
     float de=track_d_ready?app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
-    /* B-tier option 2: dbend covers the whole lit pattern, so a segment switch
-       cannot kick it. BEND_D_SCALE puts it in the same units as de. */
-    float dterm=(in_window||one_lit_hold||fork_release>0||entry_slew)?0.0f:
-        ((BEND_ENABLE && BEND_D_USE_DBEND)?
-            app_clip(dbend*BEND_D_SCALE,-LINE_D_MAX,LINE_D_MAX):de);
-    /* One flag for both effects: after a confirmed straight, cancel the
-       severity slowdowns AND restore the B1 gain boost to LINE_KP. */
-    int straight_release=(BEND_STRAIGHT_RELEASE && track_state==FOLLOW &&
-                          (int)straight_ms>=(int)BEND_STRAIGHT_MS);
-    float kp=LINE_KP;
-    /* B-tier option 1: gain scheduling; suppressed while released so BEND_KP
-       cannot sustain its own severity loop on a straight. */
-    if(BEND_ENABLE && BEND_KP_ENABLE && !straight_release)
-        kp*=1.0f+BEND_KP_K*severity;
-    dbg_kp_gain=(long)(kp*100.0f);
-    /* Right-angle corner A/B: widen the w cap ONLY while the corner test
-       fires in FOLLOW. Everywhere else the cap stays STEER_W_LIMIT. */
-    float wcap=(CORNER_W_TEST && track_state==FOLLOW && corner)?
-               CORNER_TEST_W_LIMIT:STEER_W_LIMIT;
-    dbg_wcap=wcap;
-    /* ---- UNTESTED feed-forward + speed scaling (WFF_*, default OFF) -----
-       ONE common block: FOLLOW and the island's line-following phases run
-       literally the same code. The island stays BRANCH for its whole life;
-       "island FOLLOW" = IS_ARMED / IS_LOOP / IS_LEAVE. IS_TURN_IN and
-       IS_TURN_OUT add a turn pulse and keep their original no-FF behaviour. */
-    int ff_scope=(track_state==FOLLOW);
-#if WFF_ISLAND_SCOPE == 1
-    if(track_state==BRANCH)
-        ff_scope=(island_phase==IS_ARMED || island_phase==IS_LOOP ||
-                  island_phase==IS_LEAVE);
-#elif WFF_ISLAND_SCOPE == 2
-    if(track_state==BRANCH)ff_scope=1;
+    float dterm=(in_window||one_lit_hold||fork_release>0||entry_slew)?0.0f:de;
+    *w=steer_line(e,dterm,TRACK_CRUISE/WFF_REF_V);
+#if SCOPE_STEERING
+    dbg_wcap=STEER_W_LIMIT;
 #endif
-#if WFF_SCALE_ENABLE && WFF_SCALE_STRICT
-    *w=steer_line(e,dterm,kp,track_d_ready,wcap,TRACK_CRUISE/WFF_REF_V);
-#elif WFF_SCALE_ENABLE
-    *w=steer_line(e,dterm,kp,track_d_ready,wcap,1.0f);
-    *w=app_clip(*w*(TRACK_CRUISE/WFF_REF_V),-wcap,wcap);
-#else
-    *w=steer_line(e,dterm,kp,track_d_ready,wcap,1.0f);
-#endif
-#if WFF_ENABLE
-    if(ff_scope){
-        float gate;
-#if WFF_MODE == 1
-        gate=corner?1.0f:0.0f;
-#else
-        gate=app_clip(severity/BEND_SEARCH_MIN,0.0f,1.0f);
-#endif
-        /* Added AFTER scaling, NEVER multiplied. */
-        float wff=-WFF_K*TRACK_CRUISE*(float)corner_side*gate;
+    /* Add corner feedforward after proportional scaling. */
+    if(corner && (track_state==FOLLOW || (track_state==BRANCH &&
+       (island_phase==IS_ARMED || island_phase==IS_LOOP || island_phase==IS_LEAVE)))){
+        float wff=-WFF_K*TRACK_CRUISE*(float)corner_side;
         wff=app_clip(wff,-WFF_MAX_W,WFF_MAX_W);
-        *w=app_clip(*w+wff,-wcap,wcap);
+        *w=app_clip(*w+wff,-STEER_W_LIMIT,STEER_W_LIMIT);
     }
-#else
-    (void)ff_scope; /* keep -Wall quiet when the FF term is compiled out */
-#endif
     app_error_prev=app_line_prev=e;track_d_ready=1;
-    /* Constant-speed test: cut the |w|->v and bend->v coupling so FOLLOW
-       holds TRACK_CRUISE everywhere. The island caps below are untouched. */
-    if(TRACK_FLAT_SPEED){
-        *v=TRACK_CRUISE;
-    }else{
-        /* straight_release also cancels the bend and corner slowdowns below.
-           The fork/BRANCH cap stays, so island behaviour is untouched. */
-        *v=TRACK_CRUISE/(1+fabsf(*w));
-        /* Graded slowdown: every bend reduces v, not just a right-angle
-           corner. The old binary cap is the extreme end of the same scale. */
-        if(BEND_ENABLE && BEND_SLOW_K>0.0f && !straight_release)
-            *v=fminf(*v,TRACK_CRUISE/(1.0f+BEND_SLOW_K*severity));
-        /* Corner approach: cap speed by how far the lit pattern shifted,
-           but keep the PD steering instead of a fixed bang-bang w. */
-        if(track_state==FOLLOW && !straight_release &&
-           (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
-            *v=fminf(*v,CORNER_SLOW_MPS);
-    }
-    /* Reserved right-angle-only cap: works in BOTH speed modes, so a corner
-       can be slowed later without restoring the whole graded slowdown. */
-    if(TRACK_CORNER_ONLY_MPS>0.0f && track_state==FOLLOW &&
-       (corner || fabsf(weight)>=CENTRAL_WEIGHT_MAX))
-        *v=fminf(*v,TRACK_CORNER_ONLY_MPS);
+    *v=TRACK_CRUISE;
     if(fork || track_state==BRANCH)*v=fminf(*v,0.45f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
        output rather than replacing it, so the chosen line is still tracked. */
-    if(track_state==BRANCH && BRANCH_TURN_ENABLE){
+    if(track_state==BRANCH){
         int dir=0;float turn_w=BRANCH_TURN_W;
         if(island_phase==IS_TURN_IN)dir=BRANCH_TURN_DIR;
         else if(island_phase==IS_TURN_OUT){dir=ISLAND_OUT_DIR;turn_w=ISLAND_TURN_OUT_W;}
@@ -1235,95 +786,57 @@ static void track_control(float *v,float *w){
     }
 }
 static void app_start(void){
-    if(APP_MODE==0 || app_fault)return;
-    if(!app_cal_ready || (APP_MODE>=3 && !app_parameters_ok())){app_fail(4);return;}
+    if(app_fault)return;
+    if(!app_cal_ready || !app_parameters_ok() ||
+       (APP_MODE!=6 && (TEST_SPEED_MPS<=0 || TEST_SPEED_MPS>0.5f ||
+                        MIN_SPEED_MPS>TEST_SPEED_MPS)) ||
+       (APP_MODE==4 && (STOP_AHEAD_M<0 || STOP_AHEAD_M>=0.995f ||
+                        DISTANCE_KP<=0 || HEADING_KP<=0))){
+        app_fail(4);return;
+    }
     app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
-    app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
-    track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
-    mode7_active=0;mode7_steady_ms=0;mode7_run_ms=0;
+    app_elapsed=app_lost=app_stall=0;
+    track_reset();
     app_last_completed=app_ms;app_running=1;
-    elem_test_reset();course_begin();
+#if SCOPE_OBSERVER
+    elem_test_reset();
+#endif
+    if(APP_MODE==6)course_begin();
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
-    unsigned floor_release=0; /* MODE5: let the wheels stop once the angle is reached */
+#if SCOPE_STEERING
     dbg_v=0;dbg_w=0;dbg_wcap=STEER_W_LIMIT;
-    if(!app_running){app_target_l=0;app_target_r=0;return;}
+#endif
+#if SCOPE_WHEEL_TARGETS
     app_target_l=0;app_target_r=0;
+#endif
+    if(!app_running)return;
     app_elapsed+=5;
-    if(app_elapsed>((COURSE_ENABLE && APP_MODE==6)?COURSE_TOTAL_MS:120000u) && !(MODE7_NO_TIMEOUT && APP_MODE==7)){
-        app_fail(6);return;
-    }
-    if(APP_MODE==1 || APP_MODE==2){
-        float u=TEST_REVERSE?-TEST_PWM:TEST_PWM;
-        if(app_elapsed>=10000u){App_Stop();return;}
-        app_cmd_l=APP_MODE==1?u:0;app_cmd_r=APP_MODE==2?u:0;
-        app_motor(app_cmd_l,app_cmd_r);return;
-    }
+    if(app_elapsed>(APP_MODE==6?COURSE_TOTAL_MS:120000u)){app_fail(6);return;}
     app_yaw+=gz_rad*DT;
     steer_gyro += (DT/(RATE_GYRO_TAU+DT))*(gz_rad-steer_gyro);
     if(APP_MODE==3){
-        v=TEST_SPEED_MPS;
         if(app_elapsed>=10000u){App_Stop();return;}
+        v=TEST_SPEED_MPS;
     }else if(APP_MODE==4){
         float remaining=1.0f-app_s;
         if(remaining<=0.005f+STOP_AHEAD_M){App_Stop();return;}
-        /* Keep the body speed inside the realisable set; the wheel floor below covers MODE5/6. */
         v=fmaxf(MIN_SPEED_MPS,fminf(TEST_SPEED_MPS,DISTANCE_KP*remaining));
         w=app_clip(-HEADING_KP*app_yaw,-0.8f,0.8f);
-    }else if(APP_MODE==5){
-        float e=(app_quarter+1)*TURN_STEP_RAD-app_yaw;
-        if(fabsf(e)<TURN_TOL_RAD && fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
-            app_motor(0,0);app_il=app_ir=0;app_hold+=5;
-            if(app_hold>=1000u){app_hold=0;app_quarter++;if(app_quarter>=4)App_Stop();}
-            return;
-        }
-        app_hold=0;w=app_clip(TURN_KP*e,-TURN_MAX_RAD_S,TURN_MAX_RAD_S);
-        /* Inside the settle window the floor must be released, otherwise the
-           wheels never stop and the settle check above can never pass. */
-        floor_release=(fabsf(e)<TURN_TOL_RAD);
-    }else if(APP_MODE==6){
+    }else{
         course_tick();if(!app_running)return;
         track_control(&v,&w);
         if(!app_running || app_lost)return;
         course_limit(&v,&w);if(!app_running)return;
-    }else if(APP_MODE==7){
-        float e7;
-        steer_test_control(&w,&e7);
-        if(!mode7_active && fabsf(e7)>MODE7_TRIGGER_E){
-            mode7_active=1;mode7_steady_ms=0;mode7_run_ms=0;
-        }else if(mode7_active){
-            mode7_run_ms+=5;
-            if(fabsf(e7)<MODE7_SETTLE_E){
-                mode7_steady_ms+=5;
-                if(mode7_steady_ms>=MODE7_SETTLE_MS){mode7_active=0;mode7_steady_ms=0;}
-            }else mode7_steady_ms=0;
-            if(mode7_run_ms>=MODE7_ACTIVE_MAX_MS){mode7_active=0;mode7_run_ms=0;}
-        }
-        if(!mode7_active){
-            app_motor(0,0);app_il=app_ir=0;app_cmd_l=app_cmd_r=0;
-            app_target_l=app_target_r=0;
-            return;
-        }
-        /* A common forward bias puts both wheels above the speed floor and
-           lets the differential ride on already-moving wheels. v grows with
-           |w| so the INNER wheel also stays >= MODE7_CRUISE_MPS. */
-        v=MODE7_CRUISE_MPS>0.0f?
-          MODE7_CRUISE_MPS+fabsf(w)*EFFECTIVE_TRACK_M*0.5f:0.0f;
     }
+
+#if SCOPE_STEERING
     dbg_v=v;dbg_w=w;
+#endif
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
-    /* Keep each wheel out of the deadzone in turn/line modes. The floor acts
-       on |target| and keeps the sign, so MODE5 still spins in place (opposite
-       signs) and MODE6 keeps its differential; it must NOT be applied to v,
-       which is 0 while spinning. Released at a MODE5 target so the wheels can
-       actually stop and the settle check can pass. MODE3/4 stay untouched. */
-    if(MIN_SPEED_MPS>0.0f && !floor_release &&
-       APP_MODE==5){
-        if(tl!=0.0f)tl=copysignf(fmaxf(fabsf(tl),MIN_SPEED_MPS),tl);
-        if(tr!=0.0f)tr=copysignf(fmaxf(fabsf(tr),MIN_SPEED_MPS),tr);
-    }
-    if(APP_MODE==6 && MIN_SPEED_FLOOR_MODE6 && MIN_SPEED_MPS>0){
+    /* Keep the original low-speed compensation for both wheel targets. */
+    if(APP_MODE==6 && MIN_SPEED_MPS>0){
         float outer=fmaxf(fabsf(tl),fabsf(tr));
         if(outer>0 && outer<MIN_SPEED_MPS){
             float scale=MIN_SPEED_MPS/outer;
@@ -1332,33 +845,24 @@ static void app_control(float gz_rad){
         if(fabsf(tl)<0.5f*MIN_SPEED_MPS){tl=0;app_il=0;}
         if(fabsf(tr)<0.5f*MIN_SPEED_MPS){tr=0;app_ir=0;}
     }
+#if SCOPE_WHEEL_TARGETS
     app_target_l=tl;app_target_r=tr;
-    int ff_turn=(APP_MODE==5 || (MODE7_FF_TURN && APP_MODE==7) ||
-                 (APP_MODE==6 && track_state==SEARCH));
+#endif
+    int ff_turn=(APP_MODE==6 && track_state==SEARCH);
     float ffl=ff_turn?SPEED_FF_TURN_L:SPEED_FF_L;
     float ffr=ff_turn?SPEED_FF_TURN_R:SPEED_FF_R;
     app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,ffl);
     app_cmd_r=app_pi(tr,app_vr,&app_ir,SPEED_KP_R,SPEED_KI_R,ffr);
-    /* MODE7 only: optional duty floor so a tiny target can break static
-       friction. OFF by default - a PWM floor creates a limit cycle that
-       hides the real steering response. */
-    if(APP_MODE==7 && MODE7_KICK_PWM>0.0f){
-        if(app_target_l!=0.0f)
-            app_cmd_l=copysignf(fmaxf(fabsf(app_cmd_l),MODE7_KICK_PWM),app_target_l);
-        if(app_target_r!=0.0f)
-            app_cmd_r=copysignf(fmaxf(fabsf(app_cmd_r),MODE7_KICK_PWM),app_target_r);
-    }
     /* Sustained high effort with no motion: stop instead of heating a motor. */
     if((fabsf(app_cmd_l)>MAX_PWM*0.9f && fabsf(app_vl)<0.003f)||
        (fabsf(app_cmd_r)>MAX_PWM*0.9f && fabsf(app_vr)<0.003f))app_stall+=5;
     else app_stall=0;
-    if(app_stall>=800u && !(MODE7_NO_STALL && APP_MODE==7)){app_fail(8);return;}
+    if(app_stall>=800u){app_fail(8);return;}
     app_motor(app_cmd_l,app_cmd_r);
 }
 static void App_Init(void){
     App_Stop();
-    if(APP_MODE<0 || APP_MODE>7 || MAX_PWM<=0 || MAX_PWM>0.85f ||
-       TEST_PWM<=0 || TEST_PWM>0.15f){app_fail(4);return;}
+    if(MAX_PWM<=0 || MAX_PWM>0.85f){app_fail(4);return;}
     CoreDebug->DEMCR|=CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL|=DWT_CTRL_CYCCNTENA_Msk;
     app_imu_init=dodo_BMI270_init();
@@ -1377,7 +881,7 @@ static void app_log(void){
     uint32_t period=APP_SCOPE?APP_SCOPE_PERIOD_MS:200u;
     if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
         int n;app_last_log=HAL_GetTick();
-        if(APP_SCOPE){
+#if APP_SCOPE
 #if APP_SCOPE_STATE == 5
             /* COURSE segment diagnostics (was STATE 3 in the 11-08 framework).
                CH1 segment; CH2 completed passes; CH3 element state;
@@ -1447,9 +951,9 @@ static void app_log(void){
               app_running,app_fault,ch7,
               (long)(app_cmd_r*1000));
 #endif
-        }else{
+#else
             /* One short group per 200 ms; groups are sampled separately.
-               Each group repeats every 1 second. UART transmission remains
+               Each group repeats every 1.2 seconds. UART transmission remains
                nonblocking and APP_SCOPE=1 keeps its original format. */
             static unsigned text_group;
             switch(text_group){
@@ -1488,7 +992,7 @@ static void app_log(void){
                     island_two_wait,island_two_frames,clear_frames,
                     (unsigned long)(state_ms-island_phase_start),
                     dbg_island_pair,(unsigned long)straight_ms,
-                    dbg_kp_gain,dbg_one_lit);
+                    (long)(LINE_KP*100.0f),dbg_one_lit);
                 break;
             default:
                 n=snprintf(app_tx,sizeof(app_tx),"R S%u pass%u gap%u/%u eight%u end%u F%u\r\n",
@@ -1496,7 +1000,7 @@ static void app_log(void){
                 break;
             }
             text_group=(text_group+1u)%6u;
-        }
+#endif
         app_tx_len=n>0?(unsigned)n:0;
         if(app_tx_len>=sizeof(app_tx))app_tx_len=sizeof(app_tx)-1;
         app_tx_pos=0;
@@ -1509,15 +1013,13 @@ static void App_Poll(void){
     app_log();
     if(app_fault || gap<5u)return;
     app_last_sample=now;
-    /* A long text-mode log line (rebuilt every 200 ms) can stretch one control
-       tick past 7 ms. Restarting the 400-sample gyro average on that tick made
-       APP_SCOPE 0 unable to ever finish calibration. Calibration only needs
-       "still + stable gz": uneven sampling does not bias the mean. Keep the
-       scheduling guard for a running car, but never reset the average. */
+    /* Enforce the sampling deadline while driving. */
     if(gap>7u && app_running){app_fail(3);return;}
     l=(uint16_t)__HAL_TIM_GET_COUNTER(&htim3);r=(uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
     dl=app_delta(l,app_prev_l);dr=app_delta(r,app_prev_r);app_prev_l=l;app_prev_r=r;
-    app_counts_l+=dl;app_counts_r+=dr; /* raw signs, also usable before scaling */
+#if !APP_SCOPE
+    app_counts_l+=dl;app_counts_r+=dr;
+#endif
     if(app_running && (dl>5000 || dl< -5000 || dr>5000 || dr< -5000)){app_fail(7);return;}
     app_vl=dl*LEFT_ENCODER_SIGN*METRES_PER_COUNT_L/DT;
     app_vr=dr*RIGHT_ENCODER_SIGN*METRES_PER_COUNT_R/DT;
