@@ -33,11 +33,13 @@
 #define SPEED_KI_R 0.2f
 #define SPEED_FF_L 0.15f    /* feedforward duty per (m/s) of target; 0=off; L/R independent */
 #define SPEED_FF_R 0.231f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
-#define SPEED_FF_TURN_L 0.28f  /* SEARCH feedforward for the left wheel */
-#define SPEED_FF_TURN_R 0.47f /* SEARCH feedforward for the right wheel */
+#define SPEED_FF_TURN_L 0.28f  /* left wheel feedforward in SEARCH and PIVOT */
+#define SPEED_FF_TURN_R 0.47f /* right wheel feedforward in SEARCH and PIVOT */
+/* Keep tunable speed and output limits in named macros with their units. */
 #define MAX_PWM 0.50f
 #define COURSE_SPEED_MAX_MPS 0.40f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
+#define MIN_WHEEL_TARGET_FRACTION 0.5f /* IDLE: zero wheel targets below this fraction of MIN_SPEED_MPS */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
 #define LINE_KD 0.02f
 #define LINE_D_MAX 20.0f  /* clamp on de/dt so a stale error cannot kick the D term */
@@ -47,13 +49,13 @@
    0 = original 8 channels (CH7 = cal)
    1 = CH7 becomes the state code, other 7 channels untouched
    2 = all 8 channels become island state-machine diagnostics (50 Hz)
-   3 = corner / feed-forward speed test: v cmd, v measured, w cmd, corner,
+   3 = corner / steering diagnostics: v cmd, v measured, w cmd, corner,
        w cap, lit count, [gyro rate], state code, R PWM
    4 = course element recognition observer CSV (course_element_test.h)
    5 = COURSE segment diagnostics: segment, pass, element, gap, eight,
        segment mm, fault, finish (default). */
-#define APP_SCOPE_STATE 5
-#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 5
+#define APP_SCOPE_STATE 6 /* 6 = right-angle action trace */
+#if APP_SCOPE_STATE < 0 || APP_SCOPE_STATE > 6
 #error Invalid APP_SCOPE_STATE
 #endif
 /* ---- Actual angular rate on the STATE 3 scope CSV ----------------------
@@ -73,7 +75,7 @@
 /* Compile only the measurements needed by the selected output. */
 #define SCOPE_WHEEL_TARGETS (APP_SCOPE && APP_SCOPE_STATE <= 1)
 #define SCOPE_PATTERN (!APP_SCOPE || APP_SCOPE_STATE == 2 || APP_SCOPE_STATE == 3)
-#define SCOPE_STEERING (!APP_SCOPE || APP_SCOPE_STATE == 3)
+#define SCOPE_STEERING (!APP_SCOPE || APP_SCOPE_STATE == 3 || APP_SCOPE_STATE == 6)
 #define SCOPE_OBSERVER (APP_SCOPE && APP_SCOPE_STATE == 4)
 
 #define DT 0.005f
@@ -160,6 +162,7 @@ static int app_parameters_ok(void){
       SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
       MAX_PWM>0 && MAX_PWM<=0.85f && COURSE_SPEED_MAX_MPS>0 && COURSE_SPEED_MAX_MPS<=0.5f &&
       MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=COURSE_SPEED_MAX_MPS &&
+      MIN_WHEEL_TARGET_FRACTION>=0 && MIN_WHEEL_TARGET_FRACTION<=1.0f &&
       TRACK_HEADING_KP>0 && LINE_D_MAX>0;
 }
 /* Track sensing and island tuning. Channels 0..11 run left to right. */
@@ -169,6 +172,45 @@ static int app_parameters_ok(void){
 #define CENTRAL_WEIGHT_MAX 2.0f /* |weighted sum| below this => line is centred */
 #define CORNER_HALF_HITS 6      /* all 6 sensors on one side lit => corner */
 #define CORNER_FRAMES 2         /* opposite-sign frames needed to flip a latched direction */
+/* A run can cross the middle of the array; the side is set by its outer edge. */
+/* Right-angle A/B: 0 = ordinary line control, 1 = moving arc, 2 = pivot. */
+#define CORNER_TURN_MODE 1
+#if CORNER_TURN_MODE < 0 || CORNER_TURN_MODE > 2
+#error Invalid CORNER_TURN_MODE
+#endif
+#define CORNER_ARC_RADIUS_M 0.10f
+#define CORNER_ARC_SPEED_MPS 0.20f
+#define CORNER_EXIT_SPEED_MPS 0.20f
+#define CORNER_ARC_LINE_MAX_RAD_S 0.35f /* max optical correction during arc */
+#define CORNER_PIVOT_ADVANCE_M 0.03f /* calibrate sensor-to-axle approach on track */
+#define CORNER_PIVOT_APPROACH_MPS 0.20f
+#define CORNER_PIVOT_APPROACH_MAX_RAD_S 0.60f /* heading correction cap before braking */
+#define CORNER_PIVOT_MAX_RAD_S 2.0f
+#define CORNER_PIVOT_MIN_RAD_S 1.0f /* breakaway command outside yaw tolerance */
+#define CORNER_STOP_WHEEL_MPS 0.04f
+#define CORNER_TARGET_RAD (PI_F/2.0f)
+#define CORNER_TOL_RAD (7.0f*PI_F/180.0f)
+#define CORNER_SLOW_RAD (25.0f*PI_F/180.0f)
+#define CORNER_MAX_OVERSHOOT_RAD (25.0f*PI_F/180.0f)
+#define CORNER_HEADING_KP 5.0f
+#define CORNER_HANDOFF_ANGLE_RAD (85.0f*PI_F/180.0f) /* hand back even without a line */
+#define CORNER_HANDOFF_LINE_MIN_RAD (70.0f*PI_F/180.0f) /* ignore incoming-line patterns */
+#define CORNER_HANDOFF_LINE_MIN_LIT 3 /* minimum width of the contiguous run */
+#define CORNER_HANDOFF_LEFT_FIRST_CH 4 /* left turn: run starts at ch4 */
+#define CORNER_HANDOFF_RIGHT_LAST_CH 7 /* right turn: mirror run ends at ch7 */
+#define CORNER_BRAKE_STOP_FRAMES 3u /* 15 ms below the wheel-speed threshold before pivot */
+#define CORNER_TIMEOUT_MS 4000u
+#define CORNER_EXIT_MAX_M 0.12f
+#define CORNER_REARM_M 0.02f
+#define CORNER_CROSS_VETO_M 0.03f
+#define CORNER_INCOMING_MAX_AGE_MS 120u
+#define CORNER_INCOMING_MAX_RATE 0.35f
+
+#define RIGHT_ANGLE_MIN_LIT 6
+#define RIGHT_ANGLE_MAX_LIT 9
+#define RIGHT_ANGLE_SHAPE_FRAMES 2u /* 10 ms at the 5 ms control period */
+#define RIGHT_ANGLE_BEND_MIN 0.90f /* |bend| + BEND_RATE_K * outward change */
+#define RIGHT_ANGLE_BEND_MIN_OFFSET (2.0f/11.0f) /* one sensor pitch */
 /* ---- Fork / island entry ---- */
 #define FORK_EDGE_MARGIN 2    /* an edge segment starts <=3 or ends >=8 */
 #define FORK_GAP_MIN 2        /* min blank channels between the two groups */
@@ -233,6 +275,18 @@ enum { FOLLOW, CROSS, BRANCH, SEARCH };
 enum { IS_NONE, IS_ARMED, IS_TURN_IN, IS_LOOP, IS_TURN_OUT, IS_LEAVE };
 static int track_state, edge_side, fork_frames, clear_frames;
 static int side_flip_frames, track_d_ready, track_bend_ready;
+enum { CORNER_IDLE, CORNER_ARC, CORNER_APPROACH, CORNER_BRAKE, CORNER_PIVOT };
+static int corner_phase, corner_dir, corner_rearm, corner_left_line, corner_near_goal;
+enum { CORNER_HANDOFF_NONE, CORNER_HANDOFF_LINE, CORNER_HANDOFF_ANGLE };
+static int corner_handoff_reason;
+static unsigned corner_started_ms, corner_stop_frames;
+static float corner_base_yaw, corner_start_s, corner_goal_s, corner_finished_s;
+static float corner_progress, corner_incoming_yaw;
+static unsigned corner_incoming_ms;
+static int corner_incoming_valid;
+static int right_angle_shape_side;
+static unsigned right_angle_shape_frames;
+static int right_angle_pending_bend_side;
 static int island_phase, island_fall_frames, island_out_armed;
 static int island_fell, island_two_wait, island_two_frames;
 static unsigned island_fall_ms;
@@ -255,24 +309,23 @@ static unsigned straight_ms;
 #include "course_element_test.h"
 #endif
 
-/* Nonlinear line PD, gyro damping and speed-scaled proportional terms. */
+/* Nonlinear line PD and gyro damping. */
 #define STEER_W_LIMIT 20.0f
 #define STEER2_KP2 1.50f
 #define STEER2_GYRO_KD 0.06f
 #define RATE_GYRO_TAU 0.020f
-#define WFF_K 30.0f
-#define WFF_MAX_W 100.0f
-#define WFF_REF_V 0.20f
 static float steer_gyro;
 
-static float steer_line(float e,float dterm,float pscale){
-    return app_clip(-((LINE_KP*e+STEER2_KP2*e*fabsf(e))*pscale+LINE_KD*dterm)
+static float steer_line(float e,float dterm){
+    return app_clip(-(LINE_KP*e+STEER2_KP2*e*fabsf(e)+LINE_KD*dterm)
                     -STEER2_GYRO_KD*steer_gyro,-STEER_W_LIMIT,STEER_W_LIMIT);
 }
 static void track_enter(int state){
     track_state=state;
     state_ms=0;
     clear_frames=0;
+    right_angle_shape_side=0;right_angle_shape_frames=0;
+    right_angle_pending_bend_side=0;
     entry_yaw=app_yaw;
     track_d_ready=0;     /* suppress the D term on the first frame back in FOLLOW */
     track_bend_ready=0;  /* suppress a fake dbend jump on the first frame back */
@@ -283,6 +336,9 @@ static void track_enter(int state){
 }
 static void track_reset(void){
     steer_gyro=0;
+    corner_phase=CORNER_IDLE;corner_dir=corner_rearm=0;
+    corner_progress=0;corner_incoming_valid=0;
+    corner_handoff_reason=CORNER_HANDOFF_NONE;
     track_enter(FOLLOW);
     edge_side=0; fork_frames=0;
     side_flip_frames=0;
@@ -467,10 +523,106 @@ static void course_limit(float *v,float *w){
         if(course_final){course_done=1;App_Stop();*v=*w=0;return;}
         if(course_pass>=1 && *v>0)*v=fminf(*v,COURSE_FINISH_BAR_SPEED);
     }
-    if(*v>0)*w=app_clip(*w,-1.8f*(*v)/EFFECTIVE_TRACK_M,1.8f*(*v)/EFFECTIVE_TRACK_M);
     /* Launch: the car sits ON the start cross. Hold a straight heading for a
        few frames so the bar pattern cannot kick the steering loop. */
     if(course_start_hold)*w=0.0f;
+}
+
+static float corner_speed_limit(float requested){
+    float cap=course_cruise();
+    if(course_segment==S10+1u && course_pass>=1)
+        cap=fminf(cap,COURSE_FINISH_BAR_SPEED);
+    return fminf(cap,requested);
+}
+
+static void corner_begin(int side,int centered){
+    corner_dir=-side; /* left sensor side is negative, left yaw is positive */
+    corner_phase=CORNER_TURN_MODE==1?CORNER_ARC:CORNER_APPROACH;
+    corner_base_yaw=(corner_incoming_valid &&
+        app_elapsed-corner_incoming_ms<=CORNER_INCOMING_MAX_AGE_MS)?
+        corner_incoming_yaw:app_yaw;
+    corner_incoming_valid=0;
+    corner_start_s=app_s;corner_started_ms=app_elapsed;
+    corner_stop_frames=0;
+    corner_handoff_reason=CORNER_HANDOFF_NONE;
+    corner_left_line=!centered;corner_near_goal=0;corner_progress=0;
+    edge_side=side;
+    app_lost=0;app_il=app_ir=0;app_stall=0;
+    track_d_ready=0;fork_frames=0;fork_hold_tail=fork_release=0;
+}
+
+/* Return 1 when this manoeuvre owns the current control tick. */
+static int corner_run(int centered,int visible,int line_first,int line_last,
+                      float line_error,float *v,float *w){
+    if(corner_phase==CORNER_IDLE)return 0;
+    corner_progress=corner_dir*(app_yaw-corner_base_yaw);
+    float remain=CORNER_TARGET_RAD-corner_progress;
+    if(app_elapsed-corner_started_ms>=CORNER_TIMEOUT_MS ||
+       remain < -CORNER_MAX_OVERSHOOT_RAD){
+        app_fail(14);
+        return 1;
+    }
+    if(!centered)corner_left_line=1;
+    if(corner_phase==CORNER_APPROACH){
+        if(app_s-corner_start_s<CORNER_PIVOT_ADVANCE_M){
+            *v=corner_speed_limit(CORNER_PIVOT_APPROACH_MPS);
+            *w=app_clip(TRACK_HEADING_KP*(corner_base_yaw-app_yaw),
+                        -CORNER_PIVOT_APPROACH_MAX_RAD_S,CORNER_PIVOT_APPROACH_MAX_RAD_S);
+            return 1;
+        }
+        corner_phase=CORNER_BRAKE;
+        app_il=app_ir=0;
+    }
+    if(corner_phase==CORNER_BRAKE){
+        if(fabsf(app_vl)<=CORNER_STOP_WHEEL_MPS && fabsf(app_vr)<=CORNER_STOP_WHEEL_MPS)
+            corner_stop_frames++;
+        else corner_stop_frames=0;
+        if(corner_stop_frames<CORNER_BRAKE_STOP_FRAMES)return 1;
+        corner_phase=CORNER_PIVOT;
+        /* The pivot references the incoming heading captured at detection. */
+        app_il=app_ir=0;
+    }
+    int returning_line=line_last-line_first+1>=CORNER_HANDOFF_LINE_MIN_LIT &&
+        (corner_dir>0 ? line_first==CORNER_HANDOFF_LEFT_FIRST_CH :
+                        line_last==CORNER_HANDOFF_RIGHT_LAST_CH);
+    if(corner_progress>=CORNER_HANDOFF_ANGLE_RAD ||
+       (corner_progress>=CORNER_HANDOFF_LINE_MIN_RAD && corner_left_line && returning_line)){
+        corner_handoff_reason=corner_progress>=CORNER_HANDOFF_ANGLE_RAD?
+            CORNER_HANDOFF_ANGLE:CORNER_HANDOFF_LINE;
+        corner_phase=CORNER_IDLE;
+        corner_rearm=1;corner_finished_s=app_s;
+        track_enter(FOLLOW);
+        fork_frames=0;fork_hold_tail=fork_release=0;
+        app_error_prev=app_line_prev=line_error;
+        app_il=app_ir=0;
+        return 0;
+    }
+
+    if(corner_phase==CORNER_PIVOT){
+        float speed=app_clip(CORNER_HEADING_KP*remain,
+                             CORNER_PIVOT_MIN_RAD_S,CORNER_PIVOT_MAX_RAD_S);
+        *w=corner_dir*speed;
+        return 1;
+    }
+
+    if(remain<=CORNER_TOL_RAD && !corner_near_goal){
+        corner_near_goal=1;corner_goal_s=app_s;
+    }
+    if(corner_near_goal && app_s-corner_goal_s>=CORNER_EXIT_MAX_M){
+        app_fail(14);
+        return 1;
+    }
+    *v=corner_speed_limit(remain<CORNER_SLOW_RAD?
+                          CORNER_EXIT_SPEED_MPS:CORNER_ARC_SPEED_MPS);
+    float nominal_w=*v/CORNER_ARC_RADIUS_M;
+    float desired_w=corner_dir*app_clip(CORNER_HEADING_KP*remain,-nominal_w,nominal_w);
+    if(visible && remain>=CORNER_SLOW_RAD){
+        float correction=app_clip(steer_line(line_error,0),
+                             -CORNER_ARC_LINE_MAX_RAD_S,CORNER_ARC_LINE_MAX_RAD_S);
+        desired_w=corner_dir*fmaxf(0.0f,corner_dir*(desired_w+correction));
+    }
+    *w=desired_w;
+    return 1;
 }
 
 static void track_control(float *v,float *w){
@@ -501,7 +653,14 @@ static void track_control(float *v,float *w){
     track_bend_ready=1;
     float severity=fabsf(bend)+BEND_RATE_K*fabsf(dbend);
     int wide=(groups==1 && total>=12);
-    if(course_gap_control(total,groups,bend,v,w))return;
+    if(corner_phase==CORNER_IDLE && course_gap_control(total,groups,bend,v,w)){
+        right_angle_shape_side=0;right_angle_shape_frames=0;
+        right_angle_pending_bend_side=0;
+#if SCOPE_PATTERN
+        dbg_corner=0;
+#endif
+        return;
+    }
     /* Real island entry: ONE segment probes in from an edge, the other is the
        original straight line near the middle. Requiring BOTH ends to be near
        an edge (the old test) can never match that pattern. */
@@ -537,9 +696,36 @@ static void track_control(float *v,float *w){
     }
     int central=(groups==1 && total<=CENTRAL_TOTAL_MAX &&
                  fabsf(weight)<CENTRAL_WEIGHT_MAX);
-    int corner=!wide && !fork &&
-        (severity>=BEND_SEARCH_MIN || left_hits>=CORNER_HALF_HITS ||
-         right_hits>=CORNER_HALF_HITS);
+    int corner=0;
+    int shape_side=0;
+    int pending_bend_side=0;
+    if(track_state==FOLLOW && !course_start_hold && groups==1 && total>0){
+        if(total>=RIGHT_ANGLE_MIN_LIT && total<=RIGHT_ANGLE_MAX_LIT){
+            if(starts[0]==0)shape_side=-1;
+            else if(ends[0]==11)shape_side=1;
+        }
+        /* Confirm a narrow trigger on the next frame before locking direction. */
+        if(total<RIGHT_ANGLE_MIN_LIT && fabsf(bend)>=RIGHT_ANGLE_BEND_MIN_OFFSET){
+            int bend_side=bend>0.0f?1:-1;
+            float outward_step=bend_side*dbend;
+            if(right_angle_pending_bend_side==bend_side && outward_step>=0.0f)
+                corner=1;
+            if(fabsf(bend)+BEND_RATE_K*fmaxf(0.0f,outward_step)>=RIGHT_ANGLE_BEND_MIN)
+                pending_bend_side=bend_side;
+        }
+    }else if(track_state==BRANCH){
+        /* Keep the existing turn assistance inside the island. */
+        corner=!wide && !fork &&
+            (severity>=BEND_SEARCH_MIN || left_hits>=CORNER_HALF_HITS ||
+             right_hits>=CORNER_HALF_HITS);
+    }
+    right_angle_pending_bend_side=pending_bend_side;
+    if(!shape_side || shape_side!=right_angle_shape_side)right_angle_shape_frames=0;
+    right_angle_shape_side=shape_side;
+    if(shape_side){
+        if(right_angle_shape_frames<RIGHT_ANGLE_SHAPE_FRAMES)right_angle_shape_frames++;
+        if(right_angle_shape_frames>=RIGHT_ANGLE_SHAPE_FRAMES)corner=1;
+    }
 #if SCOPE_PATTERN
     dbg_groups=groups;dbg_total=total;dbg_fork=fork;dbg_corner=corner;
 #endif
@@ -562,8 +748,33 @@ static void track_control(float *v,float *w){
         if(ends[0]<=3) side=-1;
         if(starts[0]>=8) side=1;
     }
+
+    int turn_line=groups==1 && total<=6 && total>0;
+    int turn_centered=turn_line && fabsf(bend)<=RIGHT_ANGLE_BEND_MIN_OFFSET;
+    int line_first=groups==1?starts[0]:-1;
+    int line_last=groups==1?ends[0]:-1;
+    int corner_handoff=0;
+    if(corner_phase!=CORNER_IDLE){
+        /* A newly confirmed CROSS can veto an edge-shaped false trigger
+           before committed rotation. Later wide masks belong to the turn. */
+        if(wide && course_accept() && course_spec()->checkpoint==CP_CROSS &&
+           fabsf(app_yaw-corner_base_yaw)<CORNER_TOL_RAD &&
+           app_s-corner_start_s<=CORNER_CROSS_VETO_M){
+            corner_phase=CORNER_IDLE;
+        }else{
+            if(corner_run(turn_centered,turn_line,line_first,line_last,bend,v,w))return;
+            corner_handoff=1;
+        }
+    }
+    if(corner_rearm && turn_centered && app_s-corner_finished_s>=CORNER_REARM_M)
+        corner_rearm=0;
+    if(track_state!=FOLLOW || wide || fork || !total)corner_incoming_valid=0;
+    else if(turn_centered && fabsf(steer_gyro)<=CORNER_INCOMING_MAX_RATE){
+        corner_incoming_yaw=app_yaw;corner_incoming_ms=app_elapsed;
+        corner_incoming_valid=1;
+    }
     course_observe(groups,total,fork,wide);
-    if(track_state==FOLLOW){
+    if(track_state==FOLLOW && !corner_handoff){
         if(corner){
             /* One frame is enough to open the window and latch a direction:
                a gradual bend may show an edge pattern for only one frame.
@@ -595,10 +806,19 @@ static void track_control(float *v,float *w){
             if(!ISLAND_SIDE){app_fail(5);return;}
             course_enter_element(CP_ISLAND);if(!app_running)return;
             track_enter(BRANCH);
+        }else if(CORNER_TURN_MODE!=0 && corner && !corner_rearm && !fork &&
+                 !wide && !course_gap && !course_final && !course_start_hold){
+            corner_begin(corner_side,turn_centered);
+            if(corner_run(turn_centered,turn_line,line_first,line_last,bend,v,w))return;
+            corner_handoff=1;
         }else if(!total){
             if(!edge_side)edge_side=COURSE_LOSS_SEARCH_DIR;
             track_enter(SEARCH);
         }
+    }
+    if(corner_handoff){
+        if(total)edge_side=0;
+        else track_enter(SEARCH); /* retain the turn side for lost-line recovery */
     }
     if(track_state!=FOLLOW)state_ms+=5;
     /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
@@ -759,19 +979,12 @@ static void track_control(float *v,float *w){
        to its limit. LINE_D_MAX caps the remaining single-frame jumps. */
     float de=track_d_ready?app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX):0.0f;
     float dterm=(in_window||one_lit_hold||fork_release>0||entry_slew)?0.0f:de;
-    *w=steer_line(e,dterm,TRACK_CRUISE/WFF_REF_V);
+    *w=steer_line(e,dterm);
 #if SCOPE_STEERING
     dbg_wcap=STEER_W_LIMIT;
 #endif
-    /* Add corner feedforward after proportional scaling. */
-    if(corner && (track_state==FOLLOW || (track_state==BRANCH &&
-       (island_phase==IS_ARMED || island_phase==IS_LOOP || island_phase==IS_LEAVE)))){
-        float wff=-WFF_K*TRACK_CRUISE*(float)corner_side;
-        wff=app_clip(wff,-WFF_MAX_W,WFF_MAX_W);
-        *w=app_clip(*w+wff,-STEER_W_LIMIT,STEER_W_LIMIT);
-    }
     app_error_prev=app_line_prev=e;track_d_ready=1;
-    *v=TRACK_CRUISE;
+    *v=corner_handoff?corner_speed_limit(CORNER_EXIT_SPEED_MPS):TRACK_CRUISE;
     if(fork || track_state==BRANCH)*v=fminf(*v,0.45f);
     /* Active steering only in the two turn phases. Both pulses add to the PD
        output rather than replacing it, so the chosen line is still tracked. */
@@ -788,6 +1001,21 @@ static void track_control(float *v,float *w){
 static void app_start(void){
     if(app_fault)return;
     if(!app_cal_ready || !app_parameters_ok() ||
+       (APP_MODE==6 && CORNER_TURN_MODE==1 &&
+        (!(CORNER_ARC_RADIUS_M>0) || CORNER_ARC_SPEED_MPS<=0 ||
+         CORNER_EXIT_SPEED_MPS<=0 || CORNER_ARC_LINE_MAX_RAD_S<0)) ||
+       (APP_MODE==6 && CORNER_TURN_MODE==2 &&
+        (CORNER_PIVOT_ADVANCE_M<0 || CORNER_PIVOT_APPROACH_MPS<=0 ||
+         !(CORNER_PIVOT_APPROACH_MAX_RAD_S>=0) ||
+         CORNER_PIVOT_MIN_RAD_S<=0 || CORNER_PIVOT_MIN_RAD_S>CORNER_PIVOT_MAX_RAD_S ||
+         CORNER_STOP_WHEEL_MPS<=0 || CORNER_BRAKE_STOP_FRAMES==0)) ||
+       (APP_MODE==6 && CORNER_TURN_MODE!=0 &&
+        (CORNER_TOL_RAD<=0 || CORNER_TOL_RAD>=CORNER_SLOW_RAD ||
+         CORNER_SLOW_RAD>=CORNER_TARGET_RAD ||
+         !(CORNER_HANDOFF_LINE_MIN_RAD>0 && CORNER_HANDOFF_LINE_MIN_RAD<=CORNER_HANDOFF_ANGLE_RAD &&
+           CORNER_HANDOFF_ANGLE_RAD<=CORNER_TARGET_RAD) ||
+         CORNER_TIMEOUT_MS==0 || CORNER_HEADING_KP<=0 ||
+         CORNER_EXIT_SPEED_MPS<=0 || CORNER_REARM_M<0 || CORNER_EXIT_MAX_M<=0)) ||
        (APP_MODE!=6 && (TEST_SPEED_MPS<=0 || TEST_SPEED_MPS>0.5f ||
                         MIN_SPEED_MPS>TEST_SPEED_MPS)) ||
        (APP_MODE==4 && (STOP_AHEAD_M<0 || STOP_AHEAD_M>=0.995f ||
@@ -828,7 +1056,12 @@ static void app_control(float gz_rad){
         course_tick();if(!app_running)return;
         track_control(&v,&w);
         if(!app_running || app_lost)return;
-        course_limit(&v,&w);if(!app_running)return;
+        if(corner_phase==CORNER_IDLE)course_limit(&v,&w);
+        if(!app_running)return;
+        if(corner_phase==CORNER_BRAKE){
+            app_motor(0,0);app_cmd_l=app_cmd_r=app_il=app_ir=0;
+            return;
+        }
     }
 
 #if SCOPE_STEERING
@@ -836,19 +1069,20 @@ static void app_control(float gz_rad){
 #endif
     tl=v-w*EFFECTIVE_TRACK_M*0.5f;tr=v+w*EFFECTIVE_TRACK_M*0.5f;
     /* Keep the original low-speed compensation for both wheel targets. */
-    if(APP_MODE==6 && MIN_SPEED_MPS>0){
+    if(APP_MODE==6 && corner_phase==CORNER_IDLE && MIN_SPEED_MPS>0){
         float outer=fmaxf(fabsf(tl),fabsf(tr));
         if(outer>0 && outer<MIN_SPEED_MPS){
             float scale=MIN_SPEED_MPS/outer;
             tl*=scale; tr*=scale;
         }
-        if(fabsf(tl)<0.5f*MIN_SPEED_MPS){tl=0;app_il=0;}
-        if(fabsf(tr)<0.5f*MIN_SPEED_MPS){tr=0;app_ir=0;}
+        float min_wheel_target=MIN_WHEEL_TARGET_FRACTION*MIN_SPEED_MPS;
+        if(fabsf(tl)<min_wheel_target){tl=0;app_il=0;}
+        if(fabsf(tr)<min_wheel_target){tr=0;app_ir=0;}
     }
 #if SCOPE_WHEEL_TARGETS
     app_target_l=tl;app_target_r=tr;
 #endif
-    int ff_turn=(APP_MODE==6 && track_state==SEARCH);
+    int ff_turn=(APP_MODE==6 && (track_state==SEARCH || corner_phase==CORNER_PIVOT));
     float ffl=ff_turn?SPEED_FF_TURN_L:SPEED_FF_L;
     float ffr=ff_turn?SPEED_FF_TURN_R:SPEED_FF_R;
     app_cmd_l=app_pi(tl,app_vl,&app_il,SPEED_KP_L,SPEED_KI_L,ffl);
@@ -882,7 +1116,14 @@ static void app_log(void){
     if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
         int n;app_last_log=HAL_GetTick();
 #if APP_SCOPE
-#if APP_SCOPE_STATE == 5
+#if APP_SCOPE_STATE == 6
+            /* Phase, signed yaw progress (deg x10), v (mm/s), w (mrad/s),
+               handoff reason (0 none, 1 line, 2 angle), mask, fault, and mode. */
+            n=snprintf(app_tx,sizeof(app_tx),"%d,%ld,%ld,%ld,%d,%u,%u,%d\n",
+                corner_phase,(long)(corner_dir*corner_progress*1800.0f/PI_F),
+                (long)(dbg_v*1000),(long)(dbg_w*1000),corner_handoff_reason,
+                (unsigned)app_mask,app_fault,CORNER_TURN_MODE);
+#elif APP_SCOPE_STATE == 5
             /* COURSE segment diagnostics (was STATE 3 in the 11-08 framework).
                CH1 segment; CH2 completed passes; CH3 element state;
                CH4 gap active/done (1/2); CH5 eight phase; CH6 segment mm;
@@ -894,7 +1135,7 @@ static void app_log(void){
 #elif APP_SCOPE_STATE == 4
             n=elem_test_csv(app_tx,(unsigned)sizeof(app_tx));
 #elif APP_SCOPE_STATE == 3
-            /* Corner / feed-forward speed test: every value from the SAME
+            /* Corner / steering diagnostics: every value from the SAME
                50 Hz tick. CH1 v cmd, CH2 v measured, CH3 w cmd, CH4 corner,
                CH5 w cap, CH6 lit count. APP_SCOPE_GYRO_CH7 selects the tail. */
 #if APP_SCOPE_GYRO_CH7 == 1

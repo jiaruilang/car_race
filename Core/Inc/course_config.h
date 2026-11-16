@@ -5,6 +5,7 @@
    Sx includes its END landmark: advance only after the landmark is handled.
    All lengths in metres, angles in radians, times in milliseconds. */
 #define COURSE_START_SEGMENT 1 /* 1..10; for isolated tests only, set start before its end landmark */
+#define COURSE_TEST_CRUISE_MPS 0.40f /* common cruise request for all ten segments */
 #define COURSE_TOTAL_MS 240000u
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
@@ -54,15 +55,15 @@
    FINISH_SECTION(speed, bar_count)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.30f, 2),
-    [S2]  = ISLAND_SECTION(0.25f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.25f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.25f, 2, 0.40f, 2.50f),
-    [S5]  = CROSS_SECTION(0.30f, 2),
-    [S6]  = CROSS_SECTION(0.30f, 2),
-    [S7]  = CROSS_SECTION(0.30f, 2),
-    [S8]  = ISLAND_SECTION(0.25f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.25f),
-    [S10] = FINISH_SECTION(0.30f, 2)
+    [S1]  = CROSS_SECTION(COURSE_TEST_CRUISE_MPS, 2),
+    [S2]  = ISLAND_SECTION(COURSE_TEST_CRUISE_MPS, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(COURSE_TEST_CRUISE_MPS, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(COURSE_TEST_CRUISE_MPS, 2, 0.40f, 2.50f),
+    [S5]  = CROSS_SECTION(COURSE_TEST_CRUISE_MPS, 2),
+    [S6]  = CROSS_SECTION(COURSE_TEST_CRUISE_MPS, 2),
+    [S7]  = CROSS_SECTION(COURSE_TEST_CRUISE_MPS, 2),
+    [S8]  = ISLAND_SECTION(COURSE_TEST_CRUISE_MPS, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(COURSE_TEST_CRUISE_MPS),
+    [S10] = FINISH_SECTION(COURSE_TEST_CRUISE_MPS, 2)
 };
 #endif
