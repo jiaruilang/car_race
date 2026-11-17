@@ -6,7 +6,7 @@
    All lengths in metres, angles in radians, times in milliseconds. */
 #define COURSE_ENABLE 1
 #define COURSE_START_SEGMENT 1 /* 1..10; for isolated tests only, set start before its end landmark */
-#define COURSE_TOTAL_MS 240000u
+#define COURSE_TOTAL_MS 480000u
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
 #define COURSE_REARM_MS 30u
@@ -32,42 +32,37 @@
 #define COURSE_GAP_TURN_RAD 0.42f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
-#define COURSE_FINISH_BRAKE_M 0.20f
-#define COURSE_FINISH_COAST_M 0.05f /* measure on ground; not an active brake */
-#define COURSE_FINISH_SPEED 0.25f
-/* ---- Start / finish lines are both CROSS landmarks ----------------------
-   The car is placed ON the start bar at launch and must stop on the same
-   bar at the end. Launch: hold the heading (w=0) and suppress landmark
-   acceptance for a few frames so the start bar cannot steer the car or be
-   counted. Finish (S10, FINISH_SECTION with 2 bars): first cross -> slow,
-   second cross -> stop, instead of coasting a fixed distance.
-   Outside the S4 gap, any lost line now enters SEARCH and keeps looking.
-   Every behaviour has its own A/B switch; 0 = 11-12 merged behaviour. */
-#define COURSE_START_HOLD_ENABLE 1
-#define COURSE_START_HOLD_FRAMES 20u  /* frames x 5 ms = 100 ms */
-#define COURSE_FINISH_BAR_ENABLE 1
-#define COURSE_FINISH_BAR_SPEED 0.20f /* cap after the first finish cross */
+/* From the completed finish-line crossing to motor cut-off, in metres. */
+#define COURSE_PARK_DISTANCE_M 0.20f
+#define COURSE_PARK_SPEED_MPS 0.20f
+#define COURSE_RACE_LAPS 2u
+#define ISLAND_PULSE_TRIGGER_E 0.50f
+#define ISLAND_PULSE_RETRIGGER_MS 200u /* minimum start-to-start interval */
+#define ISLAND_PULSE_W 4.50f /* rad/s */
+#define ISLAND_PULSE_MAX_RAD 1.04719755f /* 60 degrees */
 #define COURSE_LOSS_SEARCH_ENABLE 1   /* any lost line outside S4 enters SEARCH */
 #define COURSE_LOSS_SEARCH_DIR -1     /* spin side when edge_side is unknown */
-#if COURSE_START_HOLD_ENABLE < 0 || COURSE_START_HOLD_ENABLE > 1
-#error Invalid COURSE_START_HOLD_ENABLE
-#endif
-#if COURSE_FINISH_BAR_ENABLE < 0 || COURSE_FINISH_BAR_ENABLE > 1
-#error Invalid COURSE_FINISH_BAR_ENABLE
-#endif
 #if COURSE_LOSS_SEARCH_ENABLE < 0 || COURSE_LOSS_SEARCH_ENABLE > 1
 #error Invalid COURSE_LOSS_SEARCH_ENABLE
 #endif
 #if COURSE_LOSS_SEARCH_DIR != 1 && COURSE_LOSS_SEARCH_DIR != -1
 #error Invalid COURSE_LOSS_SEARCH_DIR
 #endif
-#if COURSE_START_HOLD_FRAMES > 400u
-#error Invalid COURSE_START_HOLD_FRAMES
-#endif
 /* Eight: large ring first, then opposite-direction small ring, then large
    ring's remaining half. Pattern alone cannot distinguish the three joins. */
 #define EIGHT_FIRST_MIN_M 0.50f
 #define EIGHT_FIRST_MIN_YAW 1.0f
+/* 2026-11-18: the first leg has no meaningful length of its own - the entry
+   junction is right there - so its gate is switched off. The junction
+   pattern alone advances IN -> SMALL.
+   The trailing "2" of the same junction still cannot advance twice: after
+   the hop the stage becomes SMALL, whose own gate (EIGHT_SMALL_MIN_*) is
+   0.65 m / 4.0 rad away.
+   1 = restore the old 0.50 m / 1.0 rad requirement, 0 = no first-leg gate. */
+#define EIGHT_FIRST_GATE 0
+#if EIGHT_FIRST_GATE < 0 || EIGHT_FIRST_GATE > 1
+#error Invalid EIGHT_FIRST_GATE
+#endif
 #define EIGHT_SMALL_MIN_M 0.65f
 #define EIGHT_SMALL_MIN_YAW 4.0f
 #define EIGHT_RETURN_MIN_M 0.25f
@@ -96,6 +91,6 @@ static const CourseSegment course_map[10]={
     [S7]  = CROSS_SECTION(0.40f, 2),
     [S8]  = ISLAND_SECTION(0.40f, PICK_RIGHT, PICK_LEFT),
     [S9]  = EIGHT_SECTION(0.40f),
-    [S10] = FINISH_SECTION(0.40f, 2, 0.50f)
+    [S10] = FINISH_SECTION(0.40f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
