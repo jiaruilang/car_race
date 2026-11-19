@@ -541,6 +541,7 @@ static void steer_test_control(float *w,float *e_out){
 }
 static struct {
     int direction, candidate, centered_frames;
+    int last_direction, retrigger_angle_seen;
     float start_yaw;
 } island_pulse;
 static uint32_t island_last_trigger_ms;
@@ -549,13 +550,25 @@ static void island_pulse_reset(void){
     memset(&island_pulse,0,sizeof island_pulse);
 }
 
-/* Called once per loop frame, including frames where the line is lost. */
+/* Selected run only; sensor numbers 5..8 correspond to indices 4..7. */
+static int island_pulse_centered(int start,int end){
+    int lo=start>4?start:4,hi=end<7?end:7;
+    return hi-lo+1>=3;
+}
+
+/* Called once per loop frame, including frames where the line is lost.
+   Keep the last trigger heading/direction after an ordinary pulse exit:
+   subsequent line following can still earn the 30-degree rearm latch. */
 static int island_pulse_update(int visible,float e,int centered,float *w){
+    float turn=island_pulse.last_direction*(app_yaw-island_pulse.start_yaw);
+    if(island_pulse.last_direction && turn>=ISLAND_PULSE_RETRIGGER_MIN_RAD)
+        island_pulse.retrigger_angle_seen=1;
     if(island_pulse.direction){
         island_pulse.centered_frames=centered ? island_pulse.centered_frames+1 : 0;
-        float turn=island_pulse.direction*(app_yaw-island_pulse.start_yaw);
         if(island_pulse.centered_frames>=2 || turn>=ISLAND_PULSE_MAX_RAD){
-            island_pulse_reset();
+            island_pulse.direction=0;
+            island_pulse.candidate=0;
+            island_pulse.centered_frames=0;
             return 0;
         }
     }else{
@@ -566,10 +579,13 @@ static int island_pulse_update(int visible,float e,int centered,float *w){
             island_pulse.candidate=direction;
             return 0;
         }
-        if(app_elapsed-island_last_trigger_ms<ISLAND_PULSE_RETRIGGER_MS)return 0;
+        if(island_pulse.last_direction &&
+           ((uint32_t)(app_elapsed-island_last_trigger_ms)<ISLAND_PULSE_RETRIGGER_MS ||
+            !island_pulse.retrigger_angle_seen))return 0;
         island_last_trigger_ms=app_elapsed;
-        island_pulse.direction=direction;
+        island_pulse.direction=island_pulse.last_direction=direction;
         island_pulse.start_yaw=app_yaw;
+        island_pulse.retrigger_angle_seen=0;
     }
     *w=island_pulse.direction*ISLAND_PULSE_W;
     return 1;
@@ -1273,6 +1289,7 @@ static void track_control(float *v,float *w){
             if(COURSE_ENABLE && course_spec()->eight && out &&
                !(island_out_armed && groups==1)){app_fail(11);return;}
             if(out){
+                island_pulse_reset();
                 if(course_s8_straight())junction.yaw=app_yaw;
                 island_phase=IS_TURN_OUT;island_phase_start=state_ms;
             }
@@ -1494,7 +1511,7 @@ static void track_control(float *v,float *w){
     if(corner_pulse_active)
         *w=app_clip(-CORNER_PULSE_W*(float)corner_pulse_side,-wcap,wcap);
     if(track_state==BRANCH && island_phase==IS_LOOP){
-        int centered=corner_center_seen(&starts[pick],&ends[pick],1);
+        int centered=island_pulse_centered(starts[pick],ends[pick]);
         island_pulse_update(1,e,centered,w);
     }
     app_error_prev=app_line_prev=e;track_d_ready=1;

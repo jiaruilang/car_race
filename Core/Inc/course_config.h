@@ -36,10 +36,11 @@
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
 #define COURSE_RACE_LAPS 2u
-#define ISLAND_PULSE_TRIGGER_E 0.50f
+#define ISLAND_PULSE_TRIGGER_E 0.45f
 #define ISLAND_PULSE_RETRIGGER_MS 200u /* minimum start-to-start interval */
 #define ISLAND_PULSE_W 4.50f /* rad/s */
-#define ISLAND_PULSE_MAX_RAD 1.04719755f /* 60 degrees */
+#define ISLAND_PULSE_MAX_RAD 1.22173048f /* 70 degrees, signed turn from trigger */
+#define ISLAND_PULSE_RETRIGGER_MIN_RAD 0.52359878f /* 30 degrees along last command */
 #define COURSE_LOSS_SEARCH_ENABLE 1   /* any lost line outside S4 enters SEARCH */
 #define COURSE_LOSS_SEARCH_DIR -1     /* spin side when edge_side is unknown */
 #if COURSE_LOSS_SEARCH_ENABLE < 0 || COURSE_LOSS_SEARCH_ENABLE > 1
