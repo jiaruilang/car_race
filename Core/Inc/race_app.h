@@ -38,7 +38,7 @@
 #define MAX_PWM 0.50f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.50f
+#define TEST_SPEED_MPS 0.70f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
@@ -156,7 +156,7 @@ static int app_parameters_ok(void){
       EFFECTIVE_TRACK_M>0 && SPEED_KP_L>0 && SPEED_KP_R>0 &&
       SPEED_KI_L>=0 && SPEED_KI_R>=0 && SPEED_FF_L>=0 && SPEED_FF_R>=0 &&
       SPEED_FF_TURN_L>=0 && SPEED_FF_TURN_R>=0 &&
-      MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=0.5f &&
+      MAX_PWM>0 && MAX_PWM<=0.85f && TEST_SPEED_MPS>0 && TEST_SPEED_MPS<=1.0f &&
       MIN_SPEED_MPS>=0 && MIN_SPEED_MPS<=TEST_SPEED_MPS && STOP_AHEAD_M>=0 &&
       TURN_TOL_RAD>0 && TURN_STEP_RAD>0 && TRACK_HEADING_KP>0 && LINE_D_MAX>0 &&
       (MODE7_CRUISE_MPS==0.0f ||
@@ -410,7 +410,7 @@ static struct {
    NOTE: course_limit() then clips |w| at COURSE_W_LIMIT_K*v/0.18, so a
    pulse wider than that is silently reduced.                              */
 #define CORNER_ENTER_RUN 7   /* consecutive sensors counted from one edge */
-#define CORNER_PULSE_W 5.625f        /* constant |w| during the pulse, rad/s */
+#define CORNER_PULSE_W 7.875f        /* constant |w| during the pulse, rad/s */
 #define CORNER_PULSE_EXIT_RAD 1.658f   /* ~147 deg: unconditional release */
 #define CORNER_PULSE_MIN_RAD 0.5236f    /* 30 deg: earliest release w/ centre */
 #define CORNER_PULSE_CENTER_MIN 3  /* lit sensors required inside the window */
@@ -1009,7 +1009,8 @@ static void track_control(float *v,float *w){
        original straight line near the middle. Requiring BOTH ends to be near
        an edge (the old test) can never match that pattern. */
     int fork=0, island_pair=0, one_lit_probe=0;
-    if(groups>=2){
+    int allow_fork=!COURSE_ENABLE || course_spec()->checkpoint==CP_ISLAND;
+    if(allow_fork && groups>=2){
         int last=groups-1;
         int w0=ends[0]-starts[0]+1;
         int wN=ends[last]-starts[last]+1;
@@ -1718,12 +1719,16 @@ static void App_Init(void){
     CoreDebug->DEMCR|=CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL|=DWT_CTRL_CYCCNTENA_Msk;
     app_imu_init=dodo_BMI270_init();
-    if(app_imu_init!=0){app_fail(1);return;}
-    if(HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL)!=HAL_OK ||
-       HAL_TIM_Encoder_Start(&htim4,TIM_CHANNEL_ALL)!=HAL_OK){app_fail(1);return;}
+    if(app_imu_init!=0){
+        HAL_Delay(20);
+        app_imu_init=dodo_BMI270_init();
+        if(app_imu_init!=0){app_fail(1);return;}
+    }
+    if(HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL)!=HAL_OK){app_fail(14);return;}
+    if(HAL_TIM_Encoder_Start(&htim4,TIM_CHANNEL_ALL)!=HAL_OK){app_fail(15);return;}
     app_prev_l=(uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
     app_prev_r=(uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
-    if(HAL_TIM_Base_Start_IT(&htim2)!=HAL_OK)app_fail(1);
+    if(HAL_TIM_Base_Start_IT(&htim2)!=HAL_OK)app_fail(16);
 }
 static void app_log(void){
     /* Only this function owns UART3 TX during runtime. No blocking printf. */
@@ -1743,10 +1748,15 @@ static void app_log(void){
                CH1 segment; CH2 completed passes; CH3 element state;
                CH4 gap active/done (1/2); CH5 eight phase; CH6 segment mm;
                CH7 fault; CH8 final approach/done (1/2). */
-            n=snprintf(app_tx,sizeof(app_tx),"%u,%u,%d,%u,%u,%ld,%u,%u\n",
+            if(app_fault==1u && bmi270_spi_fault==2u){
+                n=snprintf(app_tx,sizeof(app_tx),"%u,%u,%u,%u,%u,2,1,%d\n",
+                  course_segment,bmi270_timeout.rx_left,bmi270_timeout.tx_left,
+                  bmi270_timeout.spi_error,bmi270_timeout.dma_flags,app_imu_init);
+            }else n=snprintf(app_tx,sizeof(app_tx),"%u,%u,%d,%u,%u,%ld,%u,%d\n",
               course_segment,course_pass,track_state*10+island_phase,
               course_gap?1u:(course_gap_done?2u:0u),course_eight,
-              (long)((app_s-course_start_s)*1000),app_fault,course_done?2u:course_final);
+              app_fault==1u?(long)bmi270_spi_fault:(long)((app_s-course_start_s)*1000),
+              app_fault,app_fault==1u?app_imu_init:(int)(course_done?2u:course_final));
 #elif APP_SCOPE_STATE == 4
             n=elem_test_csv(app_tx,(unsigned)sizeof(app_tx));
 #elif APP_SCOPE_STATE == 3

@@ -6,6 +6,8 @@ static SPI_HandleTypeDef *bmi2_hspi = NULL;
 #define BMI270_CS_LOW()     HAL_GPIO_WritePin(BMI270_CS_GPIO_Port, BMI270_CS_Pin, GPIO_PIN_RESET)
 #define BMI270_CS_HIGH()    HAL_GPIO_WritePin(BMI270_CS_GPIO_Port, BMI270_CS_Pin, GPIO_PIN_SET)
 
+struct bmi270_read_timeout bmi270_timeout;
+uint8_t bmi270_spi_fault;
 static volatile uint8_t spi_dma_tx_rx_complete = 0;
 
 /**
@@ -32,6 +34,7 @@ BMI2_INTF_RETURN_TYPE bmi2_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_
     BMI270_CS_LOW();
 
     if (HAL_SPI_TransmitReceive_DMA(bmi2_hspi, tx_buf, rx_buf, len + 1) != HAL_OK) {
+        bmi270_spi_fault=1;
         BMI270_CS_HIGH();
         return BMI2_E_COM_FAIL;
     }
@@ -39,6 +42,11 @@ BMI2_INTF_RETURN_TYPE bmi2_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_
     uint32_t wait_start = HAL_GetTick();
     while (spi_dma_tx_rx_complete == 0) {
     if ((uint32_t)(HAL_GetTick() - wait_start) >= 100U) {
+        bmi270_timeout.rx_left=__HAL_DMA_GET_COUNTER(bmi2_hspi->hdmarx);
+        bmi270_timeout.tx_left=__HAL_DMA_GET_COUNTER(bmi2_hspi->hdmatx);
+        bmi270_timeout.spi_error=HAL_SPI_GetError(bmi2_hspi);
+        bmi270_timeout.dma_flags=(DMA1->ISR >> 4) & 0xffu;
+        bmi270_spi_fault=2;
         HAL_SPI_Abort(bmi2_hspi);
         BMI270_CS_HIGH();
         return BMI2_E_COM_FAIL;
@@ -80,6 +88,7 @@ BMI2_INTF_RETURN_TYPE bmi2_spi_write(uint8_t reg_addr, const uint8_t *reg_data, 
     BMI270_CS_LOW();
 
     if (HAL_SPI_Transmit_DMA(bmi2_hspi, tx_buf, len + 1) != HAL_OK) {
+        bmi270_spi_fault=3;
         BMI270_CS_HIGH();
         return BMI2_E_COM_FAIL;
     }else{
@@ -88,6 +97,7 @@ BMI2_INTF_RETURN_TYPE bmi2_spi_write(uint8_t reg_addr, const uint8_t *reg_data, 
     uint32_t wait_start = HAL_GetTick();
 while (spi_dma_tx_rx_complete == 0) {
     if ((uint32_t)(HAL_GetTick() - wait_start) >= 100U) {
+        bmi270_spi_fault=4;
         HAL_SPI_Abort(bmi2_hspi);
         BMI270_CS_HIGH();
         return BMI2_E_COM_FAIL;
@@ -158,6 +168,7 @@ int8_t bmi270_sensor_init_spi(struct bmi2_dev *dev, SPI_HandleTypeDef *hspi)
         return BMI2_E_NULL_PTR;
     }
     
+    bmi270_spi_fault=0;
     dwt_init(); // 初始化 DWT
     
     bmi2_hspi = hspi;
@@ -172,7 +183,10 @@ int8_t bmi270_sensor_init_spi(struct bmi2_dev *dev, SPI_HandleTypeDef *hspi)
     
     // 根据BMI270数据手册，SPI接口在初始化时需要一个dummy read来进入SPI模式
     uint8_t dummy;
-    bmi2_spi_read(BMI2_CHIP_ID_ADDR, &dummy, 1, NULL);
+    BMI270_CS_HIGH();
+    bmi2_delay_us(1000, NULL);
+    if (bmi2_spi_read(BMI2_CHIP_ID_ADDR, &dummy, 1, NULL) != BMI2_OK)
+        return BMI2_E_COM_FAIL;
     bmi2_delay_us(1000, NULL); // 延时 1ms
     
     // 初始化 BMI270

@@ -215,14 +215,25 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USART3_UART_Init();
+#if APP_SCOPE && APP_SCOPE_STATE == 5 && APP_MODE == 6
+  { static const uint8_t frame[] = "0,0,0,0,0,0,0,-1\n";
+    HAL_UART_Transmit(&huart3, (uint8_t *)frame, sizeof(frame)-1u, 10u); }
+#endif
   MX_TIM4_Init();
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   Init_brushless_motor(); //等待无刷电调负压启动完成
   /* USER CODE BEGIN 2 */
+#if APP_SCOPE && APP_SCOPE_STATE == 5 && APP_MODE == 6
+  { static const uint8_t frame[] = "0,0,0,0,0,0,0,-2\n";
+    HAL_UART_Transmit(&huart3, (uint8_t *)frame, sizeof(frame)-1u, 10u); }
+#endif
   App_Init();
+#if APP_SCOPE && APP_SCOPE_STATE == 5 && APP_MODE == 6
+  { static const uint8_t frame[] = "0,0,0,0,0,0,0,-3\n";
+    HAL_UART_Transmit(&huart3, (uint8_t *)frame, sizeof(frame)-1u, 10u); }
+#endif
 
-  dodo_BMI270_init(); // 初始化陀螺仪
   //pwm示例
   //TIM1->CCR1 = 2000;
   //TIM1->CCR2 = 2000;

@@ -4,6 +4,10 @@
 #include "stm32f1xx_hal.h"
 #include "bmi270.h"
 
+extern struct bmi270_read_timeout { unsigned rx_left, tx_left, spi_error, dma_flags; } bmi270_timeout;
+extern uint8_t bmi270_spi_fault;
+
+
 // 定义 CS 引脚
 #define BMI270_CS_GPIO_Port     GPIOA
 #define BMI270_CS_Pin           GPIO_PIN_4

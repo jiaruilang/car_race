@@ -32,7 +32,7 @@ int8_t dodo_BMI270_init(){
     }
     rslt = bmi270_set_config(&bmi270);
     if (rslt != BMI2_OK) {
-        return 2;
+        return rslt;
     } else {
         BMI270_init_flag = 1;
         return 0;
