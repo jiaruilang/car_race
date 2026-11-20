@@ -36,9 +36,14 @@
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
 #define COURSE_RACE_LAPS 2u
+/* Optional extra speed caps (m/s). Zero uses the current segment speed. */
+#define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
+#define ISLAND_EXIT_MAX_MPS 0.20f  /* first exit fork through exit turn; 0 disables */
+#define BRANCH_TURN_V 0.0f         /* visible-line entry/exit pulse */
+#define CORNER_CROSS_BLOCK_MS 0u /* Ignore CROSS for this long after each corner trigger; 0 disables. */
 #define ISLAND_PULSE_TRIGGER_E 0.24f
 #define ISLAND_PULSE_RETRIGGER_MS 300u /* minimum start-to-start interval */
-#define ISLAND_PULSE_W 5.8f /* rad/s */
+#define ISLAND_PULSE_W 8.12f /* rad/s */
 #define ISLAND_PULSE_MAX_RAD 1.22173048f /* 70 degrees, signed turn from trigger */
 #define ISLAND_PULSE_RETRIGGER_MIN_RAD 0.52359878f /* 30 degrees along last command */
 #define COURSE_LOSS_SEARCH_ENABLE 1   /* any lost line outside S4 enters SEARCH */
@@ -51,6 +56,11 @@
 #endif
 /* Eight: large ring first, then opposite-direction small ring, then large
    ring's remaining half. Pattern alone cannot distinguish the three joins. */
+#define ISLAND_EXIT_SINGLE_MS 60u /* single-line dwell for S8 and small-ring entry/exit */
+#define ISLAND_SPECIAL_ENTRY_FORK_FRAMES 2u /* S8 and figure-eight small-ring entry */
+#if ISLAND_SPECIAL_ENTRY_FORK_FRAMES < 1 || ISLAND_SPECIAL_ENTRY_FORK_FRAMES > 20
+#error Invalid ISLAND_SPECIAL_ENTRY_FORK_FRAMES
+#endif
 #define EIGHT_FIRST_MIN_M 0.50f
 #define EIGHT_FIRST_MIN_YAW 1.0f
 /* 2026-11-18: the first leg has no meaningful length of its own - the entry
@@ -83,15 +93,15 @@
    FINISH_SECTION(speed, bar_count, distance_after_last_bar_m)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.50f, 2),
-    [S2]  = ISLAND_SECTION(0.50f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.50f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.50f, 2, 0.40f, 2.50f),
-    [S5]  = CROSS_SECTION(0.50f, 2),
-    [S6]  = CROSS_SECTION(0.50f, 2),
-    [S7]  = CROSS_SECTION(0.50f, 2),
-    [S8]  = ISLAND_SECTION(0.50f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.50f),
-    [S10] = FINISH_SECTION(0.50f, 1, COURSE_PARK_DISTANCE_M)
+    [S1]  = CROSS_SECTION(0.70f, 2),
+    [S2]  = ISLAND_SECTION(0.70f, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(0.70f, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(0.70f, 2, 0.40f, 2.50f),
+    [S5]  = CROSS_SECTION(0.70f, 2),
+    [S6]  = CROSS_SECTION(0.70f, 2),
+    [S7]  = CROSS_SECTION(0.70f, 2),
+    [S8]  = ISLAND_SECTION(0.70f, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(0.70f),
+    [S10] = FINISH_SECTION(0.70f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
