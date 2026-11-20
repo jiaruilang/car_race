@@ -614,6 +614,7 @@ static void track_reset(void){ steer_reset();
 /* Course state advances ONLY on a confirmed explicit completion event.
    Queue at element exit, commit on the next control tick: the outgoing
    frame must finish selecting its line using the OLD segment's profile. */
+static unsigned course_expects_fork; /* Set on race start and segment changes. */
 static unsigned course_segment=1, course_pass, course_pending;
 static unsigned course_armed=1, course_clear_ms, course_enter_ms;
 static unsigned course_gap, course_gap_done, course_gap_started, course_gap_seen;
@@ -670,6 +671,7 @@ static void course_begin(void){
            (course_map[i].checkpoint!=CP_CROSS && course_map[i].checkpoint!=CP_ISLAND)){
             app_fail(13);return;
         }
+    course_expects_fork=(course_spec()->checkpoint==CP_ISLAND);
 }
 static void course_enter_element(unsigned type){
     if(!COURSE_ENABLE || APP_MODE!=6)return;
@@ -706,6 +708,7 @@ static void course_tick(void){
                        (start) line before counting any S1 landmarks. */
                     course_wait_start=1;
                 }else course_segment++;
+                course_expects_fork=(course_spec()->checkpoint==CP_ISLAND);
                 course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
                 course_straight_ms=0;course_eight=EIGHT_OFF;
@@ -1016,7 +1019,7 @@ static void track_control(float *v,float *w){
             fork=shape;
         /* Veto applies to ALL FORK_MODE variants, so a sharp corner cannot
            be mistaken for an island entrance regardless of the A/B setting. */
-        if(corner_lit)fork=0;
+        if(corner_lit || (COURSE_ENABLE && !course_expects_fork))fork=0;
         /* Narrow edge probe = real island entry. A wide probe, one whole side
            lit, or the full bar means a sharp corner: never open the hold. */
         int probe_narrow=
