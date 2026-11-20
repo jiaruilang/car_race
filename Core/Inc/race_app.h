@@ -16,7 +16,7 @@
 #define APP_MODE 6
 /* MODE8: straight loaded-wheel feedforward calibration, one speed per run.
    CSV: target, left/right measured (mm/s), left/right duty (x1000), run, fault. */
-#define FF_TEST_SPEED_MPS 0.30f
+#define FF_TEST_SPEED_MPS 0.31f
 #define FF_TEST_RUN_MS 3000u
 #define APP_MEASURED 1     /* set 1 only after ALL measurements below */
 #define LEFT_FORWARD_HIGH 1
