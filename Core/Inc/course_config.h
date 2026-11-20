@@ -36,7 +36,7 @@
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
 #define COURSE_RACE_LAPS 2u
-#define ISLAND_PULSE_TRIGGER_E 0.36f
+#define ISLAND_PULSE_TRIGGER_E 0.24f
 #define ISLAND_PULSE_RETRIGGER_MS 300u /* minimum start-to-start interval */
 #define ISLAND_PULSE_W 5.8f /* rad/s */
 #define ISLAND_PULSE_MAX_RAD 1.22173048f /* 70 degrees, signed turn from trigger */

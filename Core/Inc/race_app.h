@@ -38,7 +38,7 @@
 #define MAX_PWM 0.50f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.50f
+#define TEST_SPEED_MPS 0.70f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
@@ -614,7 +614,6 @@ static void track_reset(void){ steer_reset();
 /* Course state advances ONLY on a confirmed explicit completion event.
    Queue at element exit, commit on the next control tick: the outgoing
    frame must finish selecting its line using the OLD segment's profile. */
-static unsigned course_expects_fork; /* Set on race start and segment changes. */
 static unsigned course_segment=1, course_pass, course_pending;
 static unsigned course_armed=1, course_clear_ms, course_enter_ms;
 static unsigned course_gap, course_gap_done, course_gap_started, course_gap_seen;
@@ -671,7 +670,6 @@ static void course_begin(void){
            (course_map[i].checkpoint!=CP_CROSS && course_map[i].checkpoint!=CP_ISLAND)){
             app_fail(13);return;
         }
-    course_expects_fork=(course_spec()->checkpoint==CP_ISLAND);
 }
 static void course_enter_element(unsigned type){
     if(!COURSE_ENABLE || APP_MODE!=6)return;
@@ -708,7 +706,6 @@ static void course_tick(void){
                        (start) line before counting any S1 landmarks. */
                     course_wait_start=1;
                 }else course_segment++;
-                course_expects_fork=(course_spec()->checkpoint==CP_ISLAND);
                 course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
                 course_straight_ms=0;course_eight=EIGHT_OFF;
@@ -990,7 +987,8 @@ static void track_control(float *v,float *w){
        original straight line near the middle. Requiring BOTH ends to be near
        an edge (the old test) can never match that pattern. */
     int fork=0, island_pair=0, one_lit_probe=0;
-    if(groups>=2){
+    int allow_fork=!COURSE_ENABLE || course_spec()->checkpoint==CP_ISLAND;
+    if(allow_fork && groups>=2){
         int last=groups-1;
         int w0=ends[0]-starts[0]+1;
         int wN=ends[last]-starts[last]+1;
@@ -1019,7 +1017,7 @@ static void track_control(float *v,float *w){
             fork=shape;
         /* Veto applies to ALL FORK_MODE variants, so a sharp corner cannot
            be mistaken for an island entrance regardless of the A/B setting. */
-        if(corner_lit || (COURSE_ENABLE && !course_expects_fork))fork=0;
+        if(corner_lit)fork=0;
         /* Narrow edge probe = real island entry. A wide probe, one whole side
            lit, or the full bar means a sharp corner: never open the hold. */
         int probe_narrow=
@@ -1799,7 +1797,8 @@ static void app_log(void){
         app_tx_pos=0;
     }
 }
-static void App_Poll(void){
+/* Keep polling locals off the stack during App_Init(). */
+__attribute__((noinline)) static void App_Poll(void){
     uint32_t now=app_ms,gap=now-app_last_sample;
     struct bmi2_sens_data acc,gyr;
     uint16_t l,r;int32_t dl,dr;unsigned key;
