@@ -1010,6 +1010,8 @@ static void track_control(float *v,float *w){
        an edge (the old test) can never match that pattern. */
     int fork=0, island_pair=0, one_lit_probe=0;
     int allow_fork=!COURSE_ENABLE || course_spec()->checkpoint==CP_ISLAND;
+    if(COURSE_ENABLE && course_segment==9u && S9_FORK_BLOCK_M>0.0f &&
+       app_s-course_start_s<S9_FORK_BLOCK_M)allow_fork=0;
     if(allow_fork && groups>=2){
         int last=groups-1;
         int w0=ends[0]-starts[0]+1;
