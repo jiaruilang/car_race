@@ -39,11 +39,14 @@
 #define COURSE_RACE_LAPS 2u
 /* Optional extra speed caps (m/s). Zero uses the current segment speed. */
 #define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
-#define ISLAND_EXIT_MAX_MPS 0.20f  /* first exit fork through exit turn; 0 disables */
+#define ISLAND_FORK_MAX_MPS 0.40f  /* recognized island split, m/s; 0 disables */
 #define BRANCH_TURN_V 0.0f         /* visible-line entry/exit pulse */
 #define CORNER_CROSS_BLOCK_MS 0u /* Ignore CROSS for this long after each corner trigger; 0 disables. */
+#ifndef ISLAND_LOOP_USE_CORNER
+#define ISLAND_LOOP_USE_CORNER 1 /* 0: island pulse, 1: standard corner pulse in LOOP */
+#endif
 #define ISLAND_PULSE_TRIGGER_E 0.24f
-#define ISLAND_PULSE_RETRIGGER_MS 300u /* minimum start-to-start interval */
+#define ISLAND_PULSE_RETRIGGER_MS 100u /* minimum start-to-start interval */
 #define ISLAND_PULSE_W 8.12f /* rad/s */
 #define ISLAND_PULSE_MAX_RAD 1.22173048f /* 70 degrees, signed turn from trigger */
 #define ISLAND_PULSE_RETRIGGER_MIN_RAD 0.52359878f /* 30 degrees along last command */
@@ -57,8 +60,9 @@
 #endif
 /* Eight: large ring first, then opposite-direction small ring, then large
    ring's remaining half. Pattern alone cannot distinguish the three joins. */
-#define ISLAND_EXIT_SINGLE_MS 60u /* single-line dwell for S8 and small-ring entry/exit */
+#define ISLAND_EXIT_SINGLE_MS 200u /* single-line dwell for S8 and small-ring entry/exit */
 #define ISLAND_SPECIAL_ENTRY_FORK_FRAMES 2u /* S8 and figure-eight small-ring entry */
+#define S8_EXIT_FORK_FRAMES 2u /* consecutive valid forks to arm the S8 exit */
 #if ISLAND_SPECIAL_ENTRY_FORK_FRAMES < 1 || ISLAND_SPECIAL_ENTRY_FORK_FRAMES > 20
 #error Invalid ISLAND_SPECIAL_ENTRY_FORK_FRAMES
 #endif
@@ -103,6 +107,6 @@ static const CourseSegment course_map[10]={
     [S7]  = CROSS_SECTION(0.70f, 2),
     [S8]  = ISLAND_SECTION(0.70f, PICK_RIGHT, PICK_LEFT),
     [S9]  = EIGHT_SECTION(0.70f),
-    [S10] = FINISH_SECTION(0.70f, 1, COURSE_PARK_DISTANCE_M)
+    [S10] = FINISH_SECTION(0.60f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif

@@ -244,7 +244,7 @@ static int app_parameters_ok(void){
 #if ISLAND_OUT_FORK_FRAMES < 1 || ISLAND_OUT_FORK_FRAMES > 20
 #error Invalid ISLAND_OUT_FORK_FRAMES
 #endif
-#define ISLAND_LEAVE_MS 700u   /* straight running before returning to FOLLOW */
+#define ISLAND_LEAVE_MS 400u   /* straight running before returning to FOLLOW */
 #define ISLAND_OUT_DIR -1       /* +1/-1: final turn direction relative to ISLAND_SIDE */
 /* ---- Active island turn ---- */
 #define BRANCH_TURN_ENABLE 1     /* 0 = PD only, no turn pulses */
@@ -313,6 +313,7 @@ static unsigned state_ms, island_phase_start;
 /* app_log() cannot see track_control()'s locals; publish pattern flags
    once per tick so the state trace shows why a transition fired. */
 static int dbg_groups, dbg_total, dbg_fork, dbg_corner, dbg_island_pair;
+static int junction_speed_hold;
 static int dbg_one_lit; /* single-lit island probe seen this tick */
 static int fork_hold_tail, fork_release; /* sticky pre-island steering hold */
 static unsigned straight_ms; /* continuous centred-line time (ms) */
@@ -389,11 +390,11 @@ static struct {
    NOTE: course_limit() then clips |w| at COURSE_W_LIMIT_K*v/0.18, so a
    pulse wider than that is silently reduced.                              */
 #define CORNER_ENTER_RUN 6   /* consecutive sensors counted from one edge */
-#define CORNER_PULSE_W 7.4f        /* constant |w| during the pulse, rad/s */
+#define CORNER_PULSE_W 8.0f        /* constant |w| during the pulse, rad/s */
 #define CORNER_PULSE_EXIT_RAD 1.658f   /* ~147 deg: unconditional release */
 #define CORNER_PULSE_MIN_RAD 0.3490f    /* 30 deg: earliest release w/ centre */
 #define CORNER_PULSE_CENTER_MIN 3  /* lit sensors required inside the window */
-#define CORNER_PULSE_COOL_MS 100u  /* re-arm window measured from the TRIGGER frame */
+#define CORNER_PULSE_COOL_MS 50u  /* re-arm window measured from the TRIGGER frame */
 #if CORNER_ENTER_RUN < 2 || CORNER_ENTER_RUN > 12
 #error Invalid CORNER_ENTER_RUN
 #endif
@@ -879,6 +880,7 @@ static int junction_control(int groups,int total,const int *starts,const int *en
             junction.frames=junction.clear_ms=0;return 0;
         }
         int entering=s8 || course_eight==EIGHT_LARGE_IN;
+        junction_speed_hold=1;
         if(entering && ++junction.frames<ISLAND_SPECIAL_ENTRY_FORK_FRAMES)return 0;
         if(track_state==SEARCH)track_enter(FOLLOW);
         /* Entry split already confirmed; next wait for the merged line. */
@@ -903,12 +905,11 @@ static int junction_control(int groups,int total,const int *starts,const int *en
         }
     }
     int trailing=junction.phase==4;
+    junction_speed_hold=1; /* Hold through merged and missing-line frames. */
     int pick=-1;
     if(groups==2)pick=exiting ? !trailing : trailing;
     else if(groups==1)pick=0;
     junction_steer(pick,groups==1,starts,ends,v,w);
-    if(exiting && ISLAND_EXIT_MAX_MPS>0)
-        *v=fminf(*v,ISLAND_EXIT_MAX_MPS);
     if(junction.phase==4){
         if(exit_single_confirmed(groups)){
             if(exiting)track_d_ready=0;
@@ -934,14 +935,18 @@ static int junction_control(int groups,int total,const int *starts,const int *en
 static void course_limit(float *v,float *w){
     if(!COURSE_ENABLE)return;
     if(*v>0)*v=fminf(*v,course_cruise());
-    /* The first qualifying fork slows this tick, before the merge arms the turn. */
-    if(ISLAND_EXIT_MAX_MPS>0 && track_state==BRANCH &&
-       ((island_phase==IS_LOOP && (island_out_frames || island_out_armed)) ||
-        island_phase==IS_TURN_OUT))
-        *v=fminf(*v,ISLAND_EXIT_MAX_MPS);
     /* Preserve the direction of line reacquisition but drive an arc. The old
        SEARCH had v=0 and spun in place; all course-mode turns stay forward. */
     if(track_state==SEARCH){*v=course_cruise();}
+    int entry_fork=(track_state==FOLLOW || track_state==SEARCH) &&
+        !course_s8_straight() && course_accept() && fork_frames;
+    int island_turn=track_state==BRANCH &&
+        (island_phase==IS_ARMED || island_phase==IS_TURN_IN ||
+         island_phase==IS_TURN_OUT ||
+         (island_phase==IS_LOOP && (island_entry_gate==ENTRY_WAIT_SINGLE ||
+          island_out_frames || island_out_armed || island_out_pending || course_join_frames)));
+    if(ISLAND_FORK_MAX_MPS>0 && (entry_fork || island_turn || junction_speed_hold))
+        *v=fminf(*v,ISLAND_FORK_MAX_MPS);
     if(course_final){
         if(app_s-course_finish_s>=course_spec()->finish_after_last_bar_m){
             course_done=1;App_Stop();*v=*w=0;return;
@@ -967,6 +972,7 @@ static void search_arc(int direction,float *v,float *w){
     *w=app_clip(direction*CORNER_PULSE_W,-STEER_W_LIMIT,STEER_W_LIMIT);
 }
 static void track_control(float *v,float *w){
+    junction_speed_hold=0;
     int prior_corner=previous_corner_side, prior_cross=previous_cross_hit;
     /* Gap/junction ownership and all other early returns break confirmation. */
     previous_corner_side=previous_cross_hit=0;
@@ -1083,7 +1089,9 @@ static void track_control(float *v,float *w){
         if(starts[g]==0 && ends[g]>=CORNER_ENTER_RUN-1)edge_run=1;
         if(ends[g]==11 && starts[g]<=12-CORNER_ENTER_RUN)edge_run=1;
     }
-    int ordinary_island=track_state==BRANCH && course_segment!=8u && !course_spec()->eight;
+    /* S9's outer ring shares ordinary island entry and final exit with S2. */
+    int ordinary_island=track_state==BRANCH && course_segment!=8u &&
+        (!course_spec()->eight || course_eight==EIGHT_LARGE_IN || course_eight==EIGHT_LARGE_OUT);
     if(track_state==BRANCH && (island_phase==IS_TURN_IN || island_phase==IS_LOOP)){
         if(island_entry_gate==ENTRY_WAIT_SPLIT && groups>=2)
             island_entry_gate=ENTRY_WAIT_SINGLE;
@@ -1091,7 +1099,15 @@ static void track_control(float *v,float *w){
             island_entry_gate=ENTRY_CLEAR;
     }
     int leave_corner=ordinary_island && island_phase==IS_LEAVE;
-    int corner_raw=!wide && !fork && (track_state!=BRANCH || leave_corner) && (edge_run ||
+    int loop_corner=ISLAND_LOOP_USE_CORNER && track_state==BRANCH && island_phase==IS_LOOP &&
+        (!ordinary_island || island_entry_gate==ENTRY_CLEAR) && !island_out_pending;
+    int branch_corner=leave_corner || loop_corner;
+    int loop_fork=loop_corner && (fork || junction_speed_hold);
+    if(loop_fork){
+        if(corner_pulse_active)junction_speed_hold=1;
+        corner_pulse_active=0;
+    }
+    int corner_raw=!wide && !fork && !loop_fork && (track_state!=BRANCH || branch_corner) && (edge_run ||
         (BEND_ENABLE ?
             (severity>=BEND_SEARCH_MIN) :
             (left_hits>=CORNER_HALF_HITS || right_hits>=CORNER_HALF_HITS ||
@@ -1110,12 +1126,12 @@ static void track_control(float *v,float *w){
        Retrigger takes priority over old-pulse release; no rising edge is
        required. Both same-side and opposite-side hits use this one gate. */
     int corner=0;
-    if(corner_raw && !corner_pulse_cool_ms && (can_detect_element() || leave_corner))
+    if(corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
         previous_corner_side=corner_side;
     int corner_confirmed=previous_corner_side && previous_corner_side==prior_corner;
     if(track_state==SEARCH && corner_confirmed)
         track_enter(FOLLOW);
-    if(track_state!=FOLLOW && !leave_corner){
+    if(track_state!=FOLLOW && !branch_corner){
         corner_pulse_active=0;
     }else if(corner_confirmed){
         previous_corner_side=0;
@@ -1273,17 +1289,19 @@ static void track_control(float *v,float *w){
             if(ISLAND_OUT_TRIGGER==1){
                 /* Entry must finish before any exit fork frames count. */
                 int exit_ready=island_entry_gate==ENTRY_CLEAR;
+                unsigned required_frames=course_segment==8u ? S8_EXIT_FORK_FRAMES : ISLAND_OUT_FORK_FRAMES;
                 if(fork && exit_ready){
-                    if(island_out_frames<(unsigned)ISLAND_OUT_FORK_FRAMES)
+                    if(island_out_frames<required_frames)
                         island_out_frames++;
                 }else island_out_frames=0;
-                if(island_out_frames>=(unsigned)ISLAND_OUT_FORK_FRAMES)
+                if(island_out_frames>=required_frames)
                     island_out_armed=1;
                 else if(island_out_armed && groups==1){
                     if(!ordinary_island)out=1;
                     else if(!island_out_pending){
                         island_out_pending=1;
                         island_out_fall_ms=state_ms;
+                        if(loop_corner){corner_pulse_active=0;previous_corner_side=0;}
                         island_pulse_reset();
                     }
                 }
@@ -1310,9 +1328,10 @@ static void track_control(float *v,float *w){
             }
             /* A fallback timer is not a confirmed eight exit landmark. */
             if(COURSE_ENABLE && course_spec()->eight && out &&
-               !(island_out_armed && groups==1)){app_fail(11);return;}
+               !(island_out_armed && island_out_pending)){app_fail(11);return;}
             if(out){
                 island_out_pending=0;
+                if(loop_corner){corner_pulse_active=0;previous_corner_side=0;}
                 island_pulse_reset();
                 if(course_s8_straight()){junction.yaw=app_yaw;exit_single_ms=0;}
                 island_phase=IS_TURN_OUT;island_phase_start=state_ms;
@@ -1339,6 +1358,7 @@ static void track_control(float *v,float *w){
     if(course_s8_straight() && track_state==BRANCH){
         int exiting=island_phase==IS_TURN_OUT || island_phase==IS_LEAVE;
         if(island_phase==IS_LOOP && groups==2 && (island_out_frames || island_out_armed)){
+            if(loop_corner){corner_pulse_active=0;previous_corner_side=0;}
             island_pulse_reset();
             junction_steer(1,0,starts,ends,v,w);
             return;
@@ -1412,12 +1432,12 @@ static void track_control(float *v,float *w){
             int d=(island_phase==IS_TURN_OUT)?ISLAND_OUT_DIR:BRANCH_TURN_DIR;
             float nudge_w=(island_phase==IS_TURN_OUT || island_phase==IS_LEAVE)?
                 ISLAND_TURN_OUT_W:1.5f;
-            if(leave_corner && corner_pulse_active){
+            if(branch_corner && corner_pulse_active){
                 *v=TRACK_CRUISE;
                 *w=-corner_pulse_side*fminf(CORNER_PULSE_W,CORNER_W_TEST?CORNER_TEST_W_LIMIT:STEER_W_LIMIT);
                 return;
             }
-            if(island_phase==IS_LOOP && !island_out_pending && island_pulse_update(0,0,0,w)){
+            if(!ISLAND_LOOP_USE_CORNER && island_phase==IS_LOOP && !island_out_pending && island_pulse_update(0,0,0,w)){
                 *v=TRACK_CRUISE;return;
             }
             if(island_phase==IS_LOOP && !island_out_pending){
@@ -1519,7 +1539,7 @@ static void track_control(float *v,float *w){
     dbg_kp_gain=(long)(LINE_KP*100.0f);
     /* Right-angle corner A/B: widen the w cap ONLY while the corner test
        fires in FOLLOW. Everywhere else the cap stays STEER_W_LIMIT. */
-    float wcap=(CORNER_W_TEST && (track_state==FOLLOW || leave_corner) && corner)?
+    float wcap=(CORNER_W_TEST && (track_state==FOLLOW || branch_corner) && corner)?
                CORNER_TEST_W_LIMIT:STEER_W_LIMIT;
     dbg_wcap=wcap;
     /* ---- Plain PD, then the corner pulse -------------------------------
@@ -1531,7 +1551,7 @@ static void track_control(float *v,float *w){
        the sign matches. course_limit() may clip this further. */
     if(corner_pulse_active)
         *w=app_clip(-CORNER_PULSE_W*(float)corner_pulse_side,-wcap,wcap);
-    if(track_state==BRANCH && island_phase==IS_LOOP &&
+    if(!ISLAND_LOOP_USE_CORNER && track_state==BRANCH && island_phase==IS_LOOP &&
        (!ordinary_island || (island_entry_gate==ENTRY_CLEAR && !island_out_pending))){
         int centered=island_pulse_centered(starts[pick],ends[pick]);
         island_pulse_update(1,e,centered,w);
