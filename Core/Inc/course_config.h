@@ -10,7 +10,7 @@
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
 #define COURSE_REARM_MS 30u
-#define S9_FORK_BLOCK_M 0.20f /* metres from S9 entry; 0 disables */
+#define S9_FORK_BLOCK_M 0.80f /* metres from S9 entry; 0 disables */
 #define COURSE_GAP_SPEED 0.40f
 #define COURSE_GAP_MIN_M 0.40f /* reject an early short blank as successful gap traversal */
 #define COURSE_GAP_MAX_M 1.00f /* 0.65 m nominal blank + tolerance; NOT measured wheel travel */
