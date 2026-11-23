@@ -35,10 +35,10 @@
 #define SPEED_FF_R 0.107f    /* tune = steady_duty/steady_speed, e.g. 0.18/0.30=0.6 */
 #define SPEED_FF_TURN_L 0.13f  /* MODE5 only: spin-in-place load differs from straight running */
 #define SPEED_FF_TURN_R 0.107f /* tune = steady turn duty / steady turn wheel speed */
-#define MAX_PWM 0.50f
+#define MAX_PWM 0.70f
 #define TEST_PWM 0.042f
 #define TEST_REVERSE 0
-#define TEST_SPEED_MPS 0.70f
+#define TEST_SPEED_MPS 0.90f
 #define MIN_SPEED_MPS 0.200f  /* lowest sustainable speed (m/s); 0=off; fill after calibration */
 #define STOP_AHEAD_M 0.05f   /* coast distance after cut-off (m); stop early by this; 0=off */
 #define LINE_KP 2.5f       /* initial trial only; error range -1..1 */
@@ -621,6 +621,11 @@ static void track_reset(void){ steer_reset();
    Queue at element exit, commit on the next control tick: the outgoing
    frame must finish selecting its line using the OLD segment's profile. */
 static unsigned course_segment=1, course_pass, course_pending;
+/* 0/1: corners counted, 2: zigzag speed cap active, 3: section finished. */
+static unsigned s10_corner_count;
+static int s10_last_corner_side;
+static uint32_t s10_last_corner_ms;
+static float s10_zigzag_start_s;
 static unsigned course_armed=1, course_clear_ms, course_enter_ms;
 static unsigned course_gap, course_gap_done, course_gap_started, course_gap_seen;
 static unsigned course_straight_ms, course_final, course_done;
@@ -647,6 +652,7 @@ static int course_accept(void){
     return !COURSE_ENABLE || (course_armed && !course_final);
 }
 static void course_begin(void){
+    s10_corner_count=0;s10_last_corner_side=0;
     course_segment=COURSE_START_SEGMENT;course_pass=course_pending=0;
     course_armed=1;course_clear_ms=0;course_enter_ms=app_elapsed;
     course_start_s=app_s;course_last_event_s=app_s;
@@ -712,6 +718,7 @@ static void course_tick(void){
                        (start) line before counting any S1 landmarks. */
                     course_wait_start=1;
                 }else course_segment++;
+                s10_corner_count=0;s10_last_corner_side=0;
                 course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
                 course_straight_ms=0;course_eight=EIGHT_OFF;
@@ -938,6 +945,11 @@ static void course_limit(float *v,float *w){
     /* Preserve the direction of line reacquisition but drive an arc. The old
        SEARCH had v=0 and spun in place; all course-mode turns stay forward. */
     if(track_state==SEARCH){*v=course_cruise();}
+    if(course_segment==10 && s10_corner_count==2){
+        if(app_s-s10_zigzag_start_s>=S10_ZIGZAG_MIN_M &&
+           app_elapsed-s10_last_corner_ms>=S10_ZIGZAG_CLEAR_MS)s10_corner_count=3;
+        else *v=fminf(*v,S10_ZIGZAG_MAX_MPS);
+    }
     int entry_fork=(track_state==FOLLOW || track_state==SEARCH) &&
         !course_s8_straight() && course_accept() && fork_frames;
     int island_turn=track_state==BRANCH &&
@@ -1129,11 +1141,20 @@ static void track_control(float *v,float *w){
     if(corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
         previous_corner_side=corner_side;
     int corner_confirmed=previous_corner_side && previous_corner_side==prior_corner;
+    if(!corner_raw)s10_last_corner_side=0;
     if(track_state==SEARCH && corner_confirmed)
         track_enter(FOLLOW);
     if(track_state!=FOLLOW && !branch_corner){
         corner_pulse_active=0;
     }else if(corner_confirmed){
+        if(COURSE_ENABLE && course_segment==10 && s10_corner_count<3){
+            if(s10_last_corner_side!=corner_side && s10_corner_count<2){
+                s10_corner_count++;
+                if(s10_corner_count==2)s10_zigzag_start_s=app_s;
+            }
+            s10_last_corner_side=corner_side;
+            s10_last_corner_ms=app_elapsed;
+        }
         previous_corner_side=0;
         corner_pulse_active=1;
         corner_pulse_side=corner_side;

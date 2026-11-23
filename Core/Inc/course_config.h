@@ -36,6 +36,9 @@
 /* From the completed finish-line crossing to motor cut-off, in metres. */
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
+#define S10_ZIGZAG_MAX_MPS 0.60f
+#define S10_ZIGZAG_CLEAR_MS 400u
+#define S10_ZIGZAG_MIN_M 1.40f /* distance from the second confirmed corner */
 #define COURSE_RACE_LAPS 2u
 /* Optional extra speed caps (m/s). Zero uses the current segment speed. */
 #define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
@@ -107,6 +110,6 @@ static const CourseSegment course_map[10]={
     [S7]  = CROSS_SECTION(0.70f, 2),
     [S8]  = ISLAND_SECTION(0.70f, PICK_RIGHT, PICK_LEFT),
     [S9]  = EIGHT_SECTION(0.70f),
-    [S10] = FINISH_SECTION(0.60f, 1, COURSE_PARK_DISTANCE_M)
+    [S10] = FINISH_SECTION(0.70f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
