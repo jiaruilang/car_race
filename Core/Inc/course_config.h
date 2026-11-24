@@ -11,11 +11,12 @@
 #define COURSE_REARM_M 0.02f
 #define COURSE_REARM_MS 30u
 #define S9_FORK_BLOCK_M 0.80f /* metres from S9 entry; 0 disables */
-#define COURSE_GAP_SPEED 0.40f
+#define COURSE_GAP_SPEED 0.80f
 #define COURSE_GAP_MIN_M 0.40f /* reject an early short blank as successful gap traversal */
-#define COURSE_GAP_MAX_M 1.00f /* 0.65 m nominal blank + tolerance; NOT measured wheel travel */
+#define COURSE_GAP_MAX_M 2.00f /* 0.65 m nominal blank + tolerance; NOT measured wheel travel */
 #define COURSE_GAP_MAX_MS 6000u
 #define COURSE_GAP_APPROACH_MS 100u
+#define S4_GAP_AFTER_SECOND_CORNER_M 0.20f
 #define COURSE_GAP_E_MAX 0.25f
 #define COURSE_GAP_GYRO_MAX 0.35f
 #define COURSE_GAP_W_MAX 0.35f
@@ -30,13 +31,13 @@
      re-acquires too early      -> increase COURSE_GAP_MIN_M
      turns the wrong way        -> set DIR -1                              */
 #define COURSE_GAP_TURN_ENABLE 1   /* 1 = new right-turn behaviour; 0 = old straight */
-#define COURSE_GAP_TURN_RAD 0.50f  /* target yaw offset, rad (~20 deg) */
+#define COURSE_GAP_TURN_RAD 0.58f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
-#define S10_ZIGZAG_MAX_MPS 0.60f
+#define S10_ZIGZAG_MAX_MPS 0.65f
 #define S10_ZIGZAG_CLEAR_MS 400u
 #define S10_ZIGZAG_MIN_M 1.40f /* distance from the second confirmed corner */
 #define COURSE_RACE_LAPS 2u
@@ -44,6 +45,16 @@
 #define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
 #define ISLAND_FORK_MAX_MPS 0.40f  /* recognized island split, m/s; 0 disables */
 #define BRANCH_TURN_V 0.0f         /* visible-line entry/exit pulse */
+#ifndef CORNER_PREDICT_EXIT
+#define CORNER_PREDICT_EXIT 1 /* 0: original release; 1: also predict centre crossing */
+#endif
+#define CORNER_EXIT_LEAD_MS 30u
+#ifndef CORNER_CONFIRM_FRAMES
+#define CORNER_CONFIRM_FRAMES 2 /* 1: single-frame trial; 2: consecutive same-side hits */
+#endif
+#if CORNER_CONFIRM_FRAMES != 1 && CORNER_CONFIRM_FRAMES != 2
+#error Invalid CORNER_CONFIRM_FRAMES
+#endif
 #define CORNER_CROSS_BLOCK_MS 0u /* Ignore CROSS for this long after each corner trigger; 0 disables. */
 #ifndef ISLAND_LOOP_USE_CORNER
 #define ISLAND_LOOP_USE_CORNER 1 /* 0: island pulse, 1: standard corner pulse in LOOP */
@@ -66,6 +77,8 @@
 #define ISLAND_EXIT_SINGLE_MS 200u /* single-line dwell for S8 and small-ring entry/exit */
 #define ISLAND_SPECIAL_ENTRY_FORK_FRAMES 2u /* S8 and figure-eight small-ring entry */
 #define S8_EXIT_FORK_FRAMES 2u /* consecutive valid forks to arm the S8 exit */
+#define S2_EXIT_MIN_YAW_RAD 4.712389f /* 270 degrees left from entry; 0 disables */
+#define S8_EXIT_MIN_YAW_RAD 4.188790f /* 240 degrees right from entry; 0 disables */
 #if ISLAND_SPECIAL_ENTRY_FORK_FRAMES < 1 || ISLAND_SPECIAL_ENTRY_FORK_FRAMES > 20
 #error Invalid ISLAND_SPECIAL_ENTRY_FORK_FRAMES
 #endif
@@ -101,15 +114,15 @@
    FINISH_SECTION(speed, bar_count, distance_after_last_bar_m)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.70f, 2),
-    [S2]  = ISLAND_SECTION(0.70f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.70f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.70f, 2, 0.40f, 2.50f),
-    [S5]  = CROSS_SECTION(0.70f, 2),
-    [S6]  = CROSS_SECTION(0.70f, 2),
-    [S7]  = CROSS_SECTION(0.70f, 2),
-    [S8]  = ISLAND_SECTION(0.70f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.70f),
-    [S10] = FINISH_SECTION(0.70f, 1, COURSE_PARK_DISTANCE_M)
+    [S1]  = CROSS_SECTION(0.80f, 2),
+    [S2]  = ISLAND_SECTION(0.80f, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(0.80f, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(0.80f, 2, 1.0f, 3.50f),
+    [S5]  = CROSS_SECTION(0.80f, 2),
+    [S6]  = CROSS_SECTION(0.80f, 2),
+    [S7]  = CROSS_SECTION(0.80f, 2),
+    [S8]  = ISLAND_SECTION(0.80f, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(0.80f),
+    [S10] = FINISH_SECTION(0.80f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif

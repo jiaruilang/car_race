@@ -170,7 +170,6 @@ static int app_parameters_ok(void){
 #define CORNER_HALF_HITS 6      /* all 6 sensors on one side lit => corner */
 #define CORNER_WEIGHT_MIN 2.5f  /* |weighted sum| above this => one side dominates */
 #define CORNER_DWEIGHT_MIN 1.5f /* jump in weighted sum from last frame => shape change */
-#define CORNER_FRAMES 2         /* opposite-sign frames needed to flip a latched direction */
 #define TRACK_RECOVER_ON_TIMEOUT 1 /* 1: CROSS/BRANCH timeouts return to FOLLOW instead of fault 5 */
 /* ---- Fork / island entry ---- */
 #define FORK_MODE 1           /* 0 legacy both ends; 1 one edge segment + another (real car); 2 any two groups */
@@ -211,8 +210,7 @@ static int app_parameters_ok(void){
 #define BEND_STRAIGHT_MS 500u
 #define BEND_STRAIGHT_E 0.35f
 /* ---- Direction latching ---- */
-#define SIDE_ENABLE 1         /* fixed: fallback only; modes 0 (off) and 2 (override) removed */
-#define EDGE_LATCH 1          /* 1: hold a latched side until the window dies or SEARCH exits */
+#define SIDE_ENABLE 1         /* update search direction from a single edge run */
 /* SEARCH now reuses CORNER_PULSE_W, so the lost-line arc and the corner
    pulse can never drift apart. The old SEARCH_SPIN_W is gone: change the
    shared rate in the corner block instead. */
@@ -244,7 +242,7 @@ static int app_parameters_ok(void){
 #if ISLAND_OUT_FORK_FRAMES < 1 || ISLAND_OUT_FORK_FRAMES > 20
 #error Invalid ISLAND_OUT_FORK_FRAMES
 #endif
-#define ISLAND_LEAVE_MS 400u   /* straight running before returning to FOLLOW */
+#define ISLAND_LEAVE_MS 200u   /* straight running before returning to FOLLOW */
 #define ISLAND_OUT_DIR -1       /* +1/-1: final turn direction relative to ISLAND_SIDE */
 /* ---- Active island turn ---- */
 #define BRANCH_TURN_ENABLE 1     /* 0 = PD only, no turn pulses */
@@ -268,9 +266,9 @@ static int app_parameters_ok(void){
 #define BRANCH_TWO_MAX_MS 400u   /* after the fall-back, turn anyway if no split */
 /* ---- Exit turn: smaller than the entrance pulse, and follow the RIGHT
        segment of the two-segment pattern while leaving the island. ---- */
-#define ISLAND_TURN_OUT_W 0.45f   /* exit pulse rate; entrance uses BRANCH_TURN_W 1.2 */
-#define ISLAND_TURN_OUT_DELAY_MS 100u /* ordinary island: single-line fall to pulse start */
-#define ISLAND_TURN_OUT_MS 100u  /* exit pulse duration, independent of BRANCH_TURN_MS */
+#define ISLAND_TURN_OUT_W 2.0f   /* exit pulse rate; entrance uses BRANCH_TURN_W 1.2 */
+#define ISLAND_TURN_OUT_DELAY_MS 150u /* ordinary island: single-line fall to pulse start */
+#define ISLAND_TURN_OUT_MS 200u  /* exit pulse duration, independent of BRANCH_TURN_MS */
 /* After the group-count fall-back, the two-segment pattern reappears during
    the final turn. Follow the RIGHT one then; IS_LOOP is never affected. */
 #define ISLAND_OUT_FOLLOW_SIDE course_exit_side() /* +1 right, -1 left, 0 = keep ISLAND_SIDE */
@@ -299,7 +297,7 @@ static int app_parameters_ok(void){
 enum { FOLLOW, CROSS, BRANCH, SEARCH };
 enum { IS_NONE, IS_ARMED, IS_TURN_IN, IS_LOOP, IS_TURN_OUT, IS_LEAVE };
 static int track_state, edge_side, edge_age, fork_frames, clear_frames;
-static int side_flip_frames, track_d_ready, track_bend_ready;
+static int track_d_ready, track_bend_ready;
 static int island_phase, island_fall_frames, island_out_armed;
 static int island_out_pending;
 static unsigned exit_single_ms;
@@ -326,6 +324,7 @@ static float entry_yaw, entry_s, track_weight_prev, track_bend_prev;
    Declared before track_control()/app_control() so both can see them. */
 static int corner_pulse_active, corner_pulse_side;
 static float corner_entry_yaw;
+static float s8_entry_split_yaw;
 static unsigned corner_pulse_cool_ms;
 static uint32_t corner_last_trigger_ms;
 /* Junction phases: 0 idle, 1 first split, 2 merged band, 3 final split,
@@ -390,11 +389,12 @@ static struct {
    NOTE: course_limit() then clips |w| at COURSE_W_LIMIT_K*v/0.18, so a
    pulse wider than that is silently reduced.                              */
 #define CORNER_ENTER_RUN 6   /* consecutive sensors counted from one edge */
-#define CORNER_PULSE_W 8.0f        /* constant |w| during the pulse, rad/s */
+#define SEARCH_EDGE_RUN 5    /* consecutive sensors from one end to update search direction */
+#define CORNER_PULSE_W 10.5f        /* constant |w| during the pulse, rad/s */
 #define CORNER_PULSE_EXIT_RAD 1.658f   /* ~147 deg: unconditional release */
-#define CORNER_PULSE_MIN_RAD 0.3490f    /* 30 deg: earliest release w/ centre */
-#define CORNER_PULSE_CENTER_MIN 3  /* lit sensors required inside the window */
-#define CORNER_PULSE_COOL_MS 50u  /* re-arm window measured from the TRIGGER frame */
+#define CORNER_PULSE_MIN_RAD 0.349f    /* 30 deg: earliest release w/ centre */
+#define CORNER_PULSE_CENTER_MIN 2  /* lit sensors required inside the window */
+#define CORNER_PULSE_COOL_MS 25u  /* re-arm window measured from the TRIGGER frame */
 #if CORNER_ENTER_RUN < 2 || CORNER_ENTER_RUN > 12
 #error Invalid CORNER_ENTER_RUN
 #endif
@@ -577,6 +577,7 @@ static int island_pulse_update(int visible,float e,int centered,float *w){
 static unsigned search_narrow_frames;
 /* Evidence from the immediately preceding eligible control frame. */
 static int previous_corner_side, previous_cross_hit;
+static unsigned search_corner_hold_frames;
 static int can_detect_element(void){
     return track_state==FOLLOW || (track_state==SEARCH && search_narrow_frames>=3u);
 }
@@ -608,11 +609,12 @@ static void track_enter(int state){
     junction.phase=junction.frames=junction.clear_ms=junction.lost_ms=0;
 }
 static void track_reset(void){ steer_reset();
+    search_corner_hold_frames=0;
     corner_last_trigger_ms=app_elapsed-CORNER_CROSS_BLOCK_MS;
     island_last_trigger_ms=app_elapsed-ISLAND_PULSE_RETRIGGER_MS;
     track_enter(FOLLOW);
     edge_side=0; edge_age=100; fork_frames=0;
-    side_flip_frames=0; track_weight_prev=0;
+    track_weight_prev=0;
     track_bend_prev=0; track_bend_ready=0;
     fork_hold_tail=fork_release=0;straight_ms=0;
 }
@@ -623,6 +625,9 @@ static void track_reset(void){ steer_reset();
 static unsigned course_segment=1, course_pass, course_pending;
 /* 0/1: corners counted, 2: zigzag speed cap active, 3: section finished. */
 static unsigned s10_corner_count;
+static unsigned s4_corner_count;
+static float s4_second_corner_s;
+static int s4_last_corner_side;
 static int s10_last_corner_side;
 static uint32_t s10_last_corner_ms;
 static float s10_zigzag_start_s;
@@ -653,6 +658,7 @@ static int course_accept(void){
 }
 static void course_begin(void){
     s10_corner_count=0;s10_last_corner_side=0;
+    s4_corner_count=0;s4_last_corner_side=0;
     course_segment=COURSE_START_SEGMENT;course_pass=course_pending=0;
     course_armed=1;course_clear_ms=0;course_enter_ms=app_elapsed;
     course_start_s=app_s;course_last_event_s=app_s;
@@ -669,7 +675,7 @@ static void course_begin(void){
        COURSE_W_LIMIT_K<=0.0f || CORNER_PULSE_W<=0.0f ||
        JUNCTION_HEADING_KP<=0.0f ||
        EIGHT_CROSS_W_CAP<=0.0f || EIGHT_CROSS_W_CAP>STEER_W_LIMIT ||
-       CORNER_PULSE_EXIT_RAD<=0.0f || CORNER_PULSE_MIN_RAD<=0.0f ||
+       CORNER_PULSE_EXIT_RAD<=0.0f || CORNER_PULSE_MIN_RAD<0.0f ||
        CORNER_PULSE_MIN_RAD>=CORNER_PULSE_EXIT_RAD ||
        COURSE_PARK_SPEED_MPS<=0.0f || COURSE_PARK_SPEED_MPS>TEST_SPEED_MPS ||
        (COURSE_GAP_TURN_DIR!=1 && COURSE_GAP_TURN_DIR!=-1) ||
@@ -719,6 +725,7 @@ static void course_tick(void){
                     course_wait_start=1;
                 }else course_segment++;
                 s10_corner_count=0;s10_last_corner_side=0;
+                s4_corner_count=0;s4_last_corner_side=0;
                 course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
                 course_straight_ms=0;course_eight=EIGHT_OFF;
@@ -731,17 +738,23 @@ static void course_tick(void){
    a blank, with a fixed yaw reference and independent distance/time bounds. */
 static int course_gap_control(int total,int groups,float bend,float *v,float *w){
     if(!COURSE_ENABLE)return 0;
-    if(!course_gap && can_detect_element()){
+    int after_corners=course_segment==4 && s4_corner_count==2 &&
+        (track_state==FOLLOW || track_state==SEARCH);
+    if(!course_gap && (can_detect_element() || after_corners)){
         if(total && groups==1 && fabsf(bend)<=COURSE_GAP_E_MAX &&
            fabsf(steer_gyro)<=COURSE_GAP_GYRO_MAX){
             course_straight_ms+=5;course_last_line_yaw=app_yaw;
         }else if(total)course_straight_ms=0;
         float s=app_s-course_start_s;
-        if(!total && course_spec()->gap && !course_gap_done &&
-           course_straight_ms>=COURSE_GAP_APPROACH_MS &&
-           s>=course_spec()->gap_arm_min_m && s<=course_spec()->gap_arm_max_m){
+        int straight_entry=can_detect_element() && course_straight_ms>=COURSE_GAP_APPROACH_MS &&
+            s>=course_spec()->gap_arm_min_m && s<=course_spec()->gap_arm_max_m;
+        int clear_of_corner=s4_corner_count<2 ||
+            app_s-s4_second_corner_s>=S4_GAP_AFTER_SECOND_CORNER_M;
+        if(!total && course_spec()->gap && !course_gap_done && clear_of_corner &&
+           (straight_entry || after_corners)){
             if(track_state==SEARCH)track_enter(FOLLOW);
-            course_gap=1;course_gap_s=app_s;course_gap_yaw=course_last_line_yaw;
+            course_gap=1;course_gap_s=app_s;
+            course_gap_yaw=straight_entry ? course_last_line_yaw : app_yaw;
             course_gap_started=app_elapsed;course_gap_seen=0;
             /* Yaw grows counter-clockwise (gyro z, GYRO_SIGN 1), so a RIGHT
                turn SUBTRACTS the angle. Flip COURSE_GAP_TURN_DIR to turn left. */
@@ -891,6 +904,7 @@ static int junction_control(int groups,int total,const int *starts,const int *en
         if(entering && ++junction.frames<ISLAND_SPECIAL_ENTRY_FORK_FRAMES)return 0;
         if(track_state==SEARCH)track_enter(FOLLOW);
         /* Entry split already confirmed; next wait for the merged line. */
+        if(s8)s8_entry_split_yaw=app_yaw;
         junction.phase=entering?2:1;junction.frames=0;junction.clear_ms=0;
         junction.started=app_elapsed;junction.lost_ms=0;exit_single_ms=0;
         junction.yaw=app_yaw;junction.selected=0;
@@ -948,7 +962,12 @@ static void course_limit(float *v,float *w){
     if(course_segment==10 && s10_corner_count==2){
         if(app_s-s10_zigzag_start_s>=S10_ZIGZAG_MIN_M &&
            app_elapsed-s10_last_corner_ms>=S10_ZIGZAG_CLEAR_MS)s10_corner_count=3;
-        else *v=fminf(*v,S10_ZIGZAG_MAX_MPS);
+        else{
+            float cruise=course_cruise();
+            *v=fminf(*v,S10_ZIGZAG_MAX_MPS);
+            if((track_state==FOLLOW && corner_pulse_active) || track_state==SEARCH)
+                *w*=*v/cruise;
+        }
     }
     int entry_fork=(track_state==FOLLOW || track_state==SEARCH) &&
         !course_s8_straight() && course_accept() && fork_frames;
@@ -983,7 +1002,31 @@ static void search_arc(int direction,float *v,float *w){
     *v=course_cruise();
     *w=app_clip(direction*CORNER_PULSE_W,-STEER_W_LIMIT,STEER_W_LIMIT);
 }
+#if CORNER_PREDICT_EXIT
+/* Signed twice-centre offset in sensor pitches; its scale cancels in e/de. */
+static int corner_offsets[3];
+static unsigned corner_samples;
+static uint32_t corner_sample_ms;
+static int corner_center_approaching(int offset){
+    if(app_elapsed-corner_sample_ms!=5u || (corner_samples &&
+       (offset*corner_offsets[2]<=0 || abs(offset)>abs(corner_offsets[2]))))
+        corner_samples=0;
+    corner_sample_ms=app_elapsed;
+    int predicted=0;
+    if(corner_samples==3 && offset && steer_gyro*corner_pulse_side<0){
+        int closing=abs(corner_offsets[0])-abs(offset);
+        predicted=closing>0 && (unsigned)abs(offset)*15u<=(unsigned)closing*CORNER_EXIT_LEAD_MS;
+    }
+    corner_offsets[0]=corner_offsets[1];corner_offsets[1]=corner_offsets[2];
+    corner_offsets[2]=offset;
+    if(corner_samples<3)corner_samples++;
+    return predicted;
+}
+#endif
 static void track_control(float *v,float *w){
+    int prior_pulse_side=(track_state==FOLLOW && corner_pulse_active) ? corner_pulse_side : 0;
+    int keep_corner_count=search_corner_hold_frames>0;
+    if(keep_corner_count)search_corner_hold_frames--;
     junction_speed_hold=0;
     int prior_corner=previous_corner_side, prior_cross=previous_cross_hit;
     /* Gap/junction ownership and all other early returns break confirmation. */
@@ -1137,16 +1180,31 @@ static void track_control(float *v,float *w){
     /* Each accepted hit owns its direction, entry yaw and 200 ms window.
        Retrigger takes priority over old-pulse release; no rising edge is
        required. Both same-side and opposite-side hits use this one gate. */
+    if(edge_age<100)edge_age++;
+    if(SIDE_ENABLE && (track_state==FOLLOW || track_state==SEARCH) && groups>0 && !fork && !wide){
+        int left=starts[0]==0 && ends[0]>=SEARCH_EDGE_RUN-1;
+        int right=ends[groups-1]==11 && starts[groups-1]<=12-SEARCH_EDGE_RUN;
+        if(left!=right){
+            edge_side=left ? -1 : 1;
+            edge_age=0;
+        }
+    }
     int corner=0;
     if(corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
         previous_corner_side=corner_side;
-    int corner_confirmed=previous_corner_side && previous_corner_side==prior_corner;
-    if(!corner_raw)s10_last_corner_side=0;
+    int corner_confirmed=previous_corner_side &&
+        (CORNER_CONFIRM_FRAMES==1 || previous_corner_side==prior_corner);
     if(track_state==SEARCH && corner_confirmed)
         track_enter(FOLLOW);
     if(track_state!=FOLLOW && !branch_corner){
         corner_pulse_active=0;
     }else if(corner_confirmed){
+        if(course_segment==4 && !course_gap_done && s4_corner_count<2 &&
+           corner_side!=s4_last_corner_side){
+            s4_corner_count++;
+            if(s4_corner_count==2)s4_second_corner_s=app_s;
+            s4_last_corner_side=corner_side;
+        }
         if(COURSE_ENABLE && course_segment==10 && s10_corner_count<3){
             if(s10_last_corner_side!=corner_side && s10_corner_count<2){
                 s10_corner_count++;
@@ -1157,13 +1215,17 @@ static void track_control(float *v,float *w){
         }
         previous_corner_side=0;
         corner_pulse_active=1;
-        corner_pulse_side=corner_side;
+#if CORNER_PREDICT_EXIT
+        corner_samples=0;
+#endif
+        /* The ordinary-island leave pattern calls for the opposite turn. */
+        corner_pulse_side=leave_corner ? -corner_side : corner_side;
         corner_entry_yaw=app_yaw;
         corner_pulse_cool_ms=CORNER_PULSE_COOL_MS;
         corner_last_trigger_ms=app_elapsed;
         /* A new action must not inherit the old SEARCH direction or PD
            derivative/integrator history. */
-        edge_side=corner_side;edge_age=0;side_flip_frames=0;
+        edge_side=corner_side;edge_age=0;
         track_d_ready=0;rate_i=0;rate_ready=0;
         corner=1;
     }else if(corner_pulse_active){
@@ -1171,41 +1233,24 @@ static void track_control(float *v,float *w){
         /* Entry patterns cannot also count as centre-line reacquisition. */
         int center_seen=(turned>=CORNER_PULSE_MIN_RAD && !edge_run && !wide)?
             corner_center_seen(starts,ends,groups):0;
+#if CORNER_PREDICT_EXIT
+        if(groups==1 && !edge_run && !wide)
+            center_seen |= corner_center_approaching(starts[0]+ends[0]-11);
+        else corner_samples=0;
+#endif
         if(turned>=CORNER_PULSE_EXIT_RAD ||
            (turned>=CORNER_PULSE_MIN_RAD && center_seen)){
             corner_pulse_active=0;
         }else corner=1;
     }
     dbg_corner=corner;
-    int side=0;
-    if(groups==1 && total<=6){
-        if(ends[0]<=3) side=-1;
-        if(starts[0]>=8) side=1;
-    }
-    if(edge_age<100) edge_age++;
+
     /* SEARCH can confirm a fork before narrow-line reacquisition.
        Other element types retain their existing recognition gate. */
     if(track_state==FOLLOW || track_state==SEARCH)
         fork_frames=fork ? fork_frames+1 : 0;
     if(can_detect_element() || (track_state==SEARCH && fork)){
-        if(corner){
-            /* A confirmed pulse opens the window and latches a direction.
-               Once latched, a flip needs CORNER_FRAMES consistent frames.
-               While the pulse owns the turn, its frozen side also owns the
-               latch, so an all-lit frame cannot flip it mid-corner. */
-            int cs=corner_pulse_active?corner_pulse_side:corner_side;
-            edge_age=0;
-            if(!EDGE_LATCH || !edge_side){
-                edge_side=cs;side_flip_frames=0;
-            }else if(cs!=edge_side){
-                if(++side_flip_frames>=CORNER_FRAMES){
-                    edge_side=cs;side_flip_frames=0;
-                }
-            }else side_flip_frames=0;
-        }else side_flip_frames=0;
-        /* Legacy single-frame shortcut. Default OFF: it used to overwrite the
-           corner direction and could reverse the turn right before line loss. */
-        if(SIDE_ENABLE && side && !corner && !edge_side){edge_side=side;edge_age=0;}
+        if(corner)edge_age=0;
         /* Sticky window keyed on the narrow island probe, NOT on raw fork or
            groups: both flicker as the probe enters the bar, and a per-frame
            hold toggling with them is what shook the head. */
@@ -1242,6 +1287,17 @@ static void track_control(float *v,float *w){
 #else
         }   /* CORNER_NO_SEARCH: no recovery spin; a lost line stops the car */
 #endif
+    }
+    if(prior_pulse_side && track_state==SEARCH){
+        /* SEARCH already owns steering. Keep only the counted corner identity. */
+        if(course_segment==4 && s4_corner_count)s4_last_corner_side=prior_pulse_side;
+        if(course_segment==10 && s10_corner_count)s10_last_corner_side=prior_pulse_side;
+        search_corner_hold_frames=2;
+        keep_corner_count=1;
+    }
+    if(!corner_raw && !keep_corner_count){
+        s10_last_corner_side=0;
+        s4_last_corner_side=0;
     }
     if(track_state!=FOLLOW)state_ms+=5;
     /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
@@ -1310,6 +1366,12 @@ static void track_control(float *v,float *w){
             if(ISLAND_OUT_TRIGGER==1){
                 /* Entry must finish before any exit fork frames count. */
                 int exit_ready=island_entry_gate==ENTRY_CLEAR;
+                if(course_segment==2u && S2_EXIT_MIN_YAW_RAD>0.0f)
+                    exit_ready=exit_ready && app_yaw-entry_yaw>=S2_EXIT_MIN_YAW_RAD;
+                if(course_segment==8u && S8_EXIT_MIN_YAW_RAD>0.0f){
+                    float start=course_s8_straight()?s8_entry_split_yaw:entry_yaw;
+                    exit_ready=exit_ready && start-app_yaw>=S8_EXIT_MIN_YAW_RAD;
+                }
                 unsigned required_frames=course_segment==8u ? S8_EXIT_FORK_FRAMES : ISLAND_OUT_FORK_FRAMES;
                 if(fork && exit_ready){
                     if(island_out_frames<required_frames)
