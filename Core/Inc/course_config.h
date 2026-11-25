@@ -5,6 +5,22 @@
    Sx includes its END landmark: advance only after the landmark is handled.
    All lengths in metres, angles in radians, times in milliseconds. */
 #define COURSE_ENABLE 1
+#ifndef FORK_TEST_MODE
+#define FORK_TEST_MODE 0 /* 1: single island segment with fork telemetry */
+#endif
+#ifndef FORK_TEST_SEGMENT
+#define FORK_TEST_SEGMENT 9 /* 2, 8 or 9; start before the island entrance */
+#endif
+#if FORK_TEST_MODE && FORK_TEST_SEGMENT != 2 && FORK_TEST_SEGMENT != 8 && FORK_TEST_SEGMENT != 9
+#error Invalid FORK_TEST_SEGMENT
+#endif
+#ifndef RACE_FORK_SINGLE_FRAME
+#define RACE_FORK_SINGLE_FRAME 1 /* Race A/B: 0 = original thresholds, 1 = one frame */
+#endif
+#if RACE_FORK_SINGLE_FRAME != 0 && RACE_FORK_SINGLE_FRAME != 1
+#error Invalid RACE_FORK_SINGLE_FRAME
+#endif
+#define FORK_CONFIRM_COUNT(normal) ((FORK_TEST_MODE || RACE_FORK_SINGLE_FRAME) ? 1u : (normal))
 #define COURSE_START_SEGMENT 1 /* 1..10; for isolated tests only, set start before its end landmark */
 #define COURSE_TOTAL_MS 480000u
 #define COURSE_SEGMENT_MS 90000u
@@ -31,26 +47,65 @@
      re-acquires too early      -> increase COURSE_GAP_MIN_M
      turns the wrong way        -> set DIR -1                              */
 #define COURSE_GAP_TURN_ENABLE 1   /* 1 = new right-turn behaviour; 0 = old straight */
-#define COURSE_GAP_TURN_RAD 0.58f  /* target yaw offset, rad (~20 deg) */
+#define COURSE_GAP_TURN_RAD 0.62f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
 #define COURSE_PARK_DISTANCE_M 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
+#ifndef CORNER_SLOW_MODE
+#define CORNER_SLOW_MODE 0 /* 0: A, cruise through turns; 1: B, apply corner speed cap */
+#endif
+#define CORNER_A_PULSE_W 11.8f  /* rad/s, corner and SEARCH */
+#define CORNER_B_PULSE_W 7.5f /* rad/s, corner and SEARCH */
+#define CORNER_MAX_MPS 0.2f /* B only: 0 commands a pivot */
+#if CORNER_SLOW_MODE == 1
+#define CORNER_PULSE_W CORNER_B_PULSE_W
+#elif CORNER_SLOW_MODE == 0
+#define CORNER_PULSE_W CORNER_A_PULSE_W
+#else
+#error Invalid CORNER_SLOW_MODE
+#endif
 #define S10_ZIGZAG_MAX_MPS 0.65f
 #define S10_ZIGZAG_CLEAR_MS 400u
 #define S10_ZIGZAG_MIN_M 1.40f /* distance from the second confirmed corner */
 #define COURSE_RACE_LAPS 2u
 /* Optional extra speed caps (m/s). Zero uses the current segment speed. */
 #define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
-#define ISLAND_FORK_MAX_MPS 0.40f  /* recognized island split, m/s; 0 disables */
+#define ISLAND_FORK_MAX_MPS 0.0f   /* recognized island split, m/s; 0 disables */
+#define ORDINARY_ENTRY_PULSE_MS 50u /* S2 and S9 large-ring entry steering assist */
 #define BRANCH_TURN_V 0.0f         /* visible-line entry/exit pulse */
+/* Effective same-direction yaw after handing a corner back to line PD. */
+#ifndef CORNER_COAST_EXIT
+#define CORNER_COAST_EXIT 1
+#endif
+#ifndef TURN_ANGLE_METHOD
+#define TURN_ANGLE_METHOD 1 /* 1 optical flow; 2 fitted line; 3 fit with flow fallback */
+#endif
+#if TURN_ANGLE_METHOD < 1 || TURN_ANGLE_METHOD > 3
+#error Invalid TURN_ANGLE_METHOD
+#endif
+#define TURN_SENSOR_PITCH_M 0.00636f /* provisional: measure sensor 1 to 12, divide by 11 */
+#define TURN_SENSOR_FORWARD_M 0.125f /* provisional: axle midpoint to optical row */
+#define TURN_FIT_SAMPLES 5
+#define TURN_FIT_MIN_SPAN_M 0.020f
+#define TURN_FIT_MAX_RMS_M 0.003f
+#define CORNER_COAST_TIME_MS 30u
+#define CORNER_FLOW_MIN_SHIFT 1.0f /* sensor pitches across the sample window */
 #ifndef CORNER_PREDICT_EXIT
 #define CORNER_PREDICT_EXIT 1 /* 0: original release; 1: also predict centre crossing */
 #endif
-#define CORNER_EXIT_LEAD_MS 30u
+#ifndef TURN_PREDICT_SAMPLE_FRAMES
+#define TURN_PREDICT_SAMPLE_FRAMES 2
+#endif
+#ifndef TURN_PREDICT_LEAD_FRAMES
+#define TURN_PREDICT_LEAD_FRAMES 3
+#endif
+#if TURN_PREDICT_SAMPLE_FRAMES < 2 || TURN_PREDICT_SAMPLE_FRAMES > 32 || TURN_PREDICT_LEAD_FRAMES < 1 || TURN_PREDICT_LEAD_FRAMES > 32
+#error Invalid turn prediction window
+#endif
 #ifndef CORNER_CONFIRM_FRAMES
-#define CORNER_CONFIRM_FRAMES 2 /* 1: single-frame trial; 2: consecutive same-side hits */
+#define CORNER_CONFIRM_FRAMES 1 /* 1: single-frame trial; 2: consecutive same-side hits */
 #endif
 #if CORNER_CONFIRM_FRAMES != 1 && CORNER_CONFIRM_FRAMES != 2
 #error Invalid CORNER_CONFIRM_FRAMES
@@ -74,24 +129,28 @@
 #endif
 /* Eight: large ring first, then opposite-direction small ring, then large
    ring's remaining half. Pattern alone cannot distinguish the three joins. */
-#define ISLAND_EXIT_SINGLE_MS 200u /* single-line dwell for S8 and small-ring entry/exit */
+#ifndef SPECIAL_ISLAND_SINGLE_FORK
+#define SPECIAL_ISLAND_SINGLE_FORK 1 /* A: phased junction; B: one fork per transition */
+#endif
+#ifndef SPECIAL_ISLAND_HOLD_MS
+#define SPECIAL_ISLAND_HOLD_MS 30u /* heading hold and retrigger lockout */
+#endif
+#define ORDINARY_EXIT_SIDE_DELAY_MS 10u /* from exit fall-back to exit-side selection */
+#define ORDINARY_PULSE_DELAY_MS 10u /* from exit fall-back to exit pulse */
+#define ORDINARY_ELEMENT_UNLOCK_RAD 0.17266463f /* 50 degrees */
+#define ISLAND_EXIT_PULSE_RAD 0.2617994f /* 15 degrees */
+#define ISLAND_EXIT_SINGLE_MS 50u /* single-line dwell for S8 and small-ring entry/exit */
 #define ISLAND_SPECIAL_ENTRY_FORK_FRAMES 2u /* S8 and figure-eight small-ring entry */
 #define S8_EXIT_FORK_FRAMES 2u /* consecutive valid forks to arm the S8 exit */
-#define S2_EXIT_MIN_YAW_RAD 4.712389f /* 270 degrees left from entry; 0 disables */
+#define S2_EXIT_MIN_M 0.70f /* S2 exit fork gate, metres from island entry; 0 disables */
 #define S8_EXIT_MIN_YAW_RAD 4.188790f /* 240 degrees right from entry; 0 disables */
 #if ISLAND_SPECIAL_ENTRY_FORK_FRAMES < 1 || ISLAND_SPECIAL_ENTRY_FORK_FRAMES > 20
 #error Invalid ISLAND_SPECIAL_ENTRY_FORK_FRAMES
 #endif
 #define EIGHT_FIRST_MIN_M 0.50f
 #define EIGHT_FIRST_MIN_YAW 1.0f
-/* 2026-11-18: the first leg has no meaningful length of its own - the entry
-   junction is right there - so its gate is switched off. The junction
-   pattern alone advances IN -> SMALL.
-   The trailing "2" of the same junction still cannot advance twice: after
-   the hop the stage becomes SMALL, whose own gate (EIGHT_SMALL_MIN_*) is
-   0.65 m / 4.0 rad away.
-   1 = restore the old 0.50 m / 1.0 rad requirement, 0 = no first-leg gate. */
-#define EIGHT_FIRST_GATE 0
+/* Signed left yaw from the S9 outer entry fork; distance gate is optional. */
+#define EIGHT_FIRST_GATE 0 /* 1 also requires EIGHT_FIRST_MIN_M */
 #if EIGHT_FIRST_GATE < 0 || EIGHT_FIRST_GATE > 1
 #error Invalid EIGHT_FIRST_GATE
 #endif
@@ -114,15 +173,15 @@
    FINISH_SECTION(speed, bar_count, distance_after_last_bar_m)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.80f, 2),
-    [S2]  = ISLAND_SECTION(0.80f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.80f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.80f, 2, 1.0f, 3.50f),
-    [S5]  = CROSS_SECTION(0.80f, 2),
-    [S6]  = CROSS_SECTION(0.80f, 2),
-    [S7]  = CROSS_SECTION(0.80f, 2),
-    [S8]  = ISLAND_SECTION(0.80f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.80f),
-    [S10] = FINISH_SECTION(0.80f, 1, COURSE_PARK_DISTANCE_M)
+    [S1]  = CROSS_SECTION(0.85f, 2),
+    [S2]  = ISLAND_SECTION(0.85f, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(0.85f, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(0.85f, 2, 0.9f, 3.50f),
+    [S5]  = CROSS_SECTION(0.85f, 2),
+    [S6]  = CROSS_SECTION(0.85f, 2),
+    [S7]  = CROSS_SECTION(0.85f, 2),
+    [S8]  = ISLAND_SECTION(0.85f, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(0.85f),
+    [S10] = FINISH_SECTION(0.85f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
