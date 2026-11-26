@@ -22,17 +22,25 @@
 #endif
 #define FORK_CONFIRM_COUNT(normal) ((FORK_TEST_MODE || RACE_FORK_SINGLE_FRAME) ? 1u : (normal))
 #define COURSE_START_SEGMENT 1 /* 1..10; for isolated tests only, set start before its end landmark */
+#ifndef SEARCH_SWEEP_TEST
+#define SEARCH_SWEEP_TEST 0
+#endif
+#define SEARCH_SWEEP_SPEED_MPS 0.60f
+#define SEARCH_SWEEP_W_RAD_S 12.5f
+#define SEARCH_SWEEP_TRIGGER_M 0.40f /* from the starting position */
+#define SEARCH_SWEEP_DIR 1 /* +1 left, -1 right */
+#define SEARCH_SWEEP_AFTER_MS 250u
 #define COURSE_TOTAL_MS 480000u
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
 #define COURSE_REARM_MS 30u
 #define S9_FORK_BLOCK_M 0.80f /* metres from S9 entry; 0 disables */
-#define COURSE_GAP_SPEED 0.80f
+#define COURSE_GAP_SPEED 0.85f
 #define COURSE_GAP_MIN_M 0.40f /* reject an early short blank as successful gap traversal */
 #define COURSE_GAP_MAX_M 2.00f /* 0.65 m nominal blank + tolerance; NOT measured wheel travel */
 #define COURSE_GAP_MAX_MS 6000u
 #define COURSE_GAP_APPROACH_MS 100u
-#define S4_GAP_AFTER_SECOND_CORNER_M 0.20f
+#define S4_GAP_AFTER_SECOND_CORNER_M 0.15f /* from the end of the second confirmed bend */
 #define COURSE_GAP_E_MAX 0.25f
 #define COURSE_GAP_GYRO_MAX 0.35f
 #define COURSE_GAP_W_MAX 0.35f
@@ -51,7 +59,9 @@
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
-#define COURSE_PARK_DISTANCE_M 0.20f
+#define COURSE_PARK_DISTANCE_M 0.40f
+#define COURSE_PARK_WAIT_MS 1000u
+#define COURSE_PARK_TURN_WHEEL_MPS 0.20f
 #define COURSE_PARK_SPEED_MPS 0.20f
 #ifndef CORNER_SLOW_MODE
 #define CORNER_SLOW_MODE 0 /* 0: A, cruise through turns; 1: B, apply corner speed cap */
@@ -66,10 +76,17 @@
 #else
 #error Invalid CORNER_SLOW_MODE
 #endif
-#define S10_ZIGZAG_MAX_MPS 0.65f
-#define S10_ZIGZAG_CLEAR_MS 400u
+#define S10_ZIGZAG_MAX_MPS 0.75f
+#define S10_ZIGZAG_CLEAR_MS 300u
 #define S10_ZIGZAG_MIN_M 1.40f /* distance from the second confirmed corner */
 #define COURSE_RACE_LAPS 2u
+#define COURSE_CORNER_EXIT_LEAD_DEG 40u /* lead for mapped 90-degree corners */
+#define COURSE_RIGHT_ANGLE_BRAKE_MS 25u /* hold zero yaw rate after release */
+#ifndef COURSE_RIGHT_ANGLE_TEST
+#define COURSE_RIGHT_ANGLE_TEST 0 /* 0: A, normal drive; 1: B, slow confirmed right angles */
+#endif
+#define COURSE_RIGHT_ANGLE_MAX_MPS 0.80f
+#define COURSE_RIGHT_ANGLE_PULSE_W 17.0f
 /* Optional extra speed caps (m/s). Zero uses the current segment speed. */
 #define FORK_BRANCH_MAX_MPS 0.0f   /* fork or visible-line island tracking */
 #define ISLAND_FORK_MAX_MPS 0.0f   /* recognized island split, m/s; 0 disables */
@@ -176,7 +193,7 @@ static const CourseSegment course_map[10]={
     [S1]  = CROSS_SECTION(0.85f, 2),
     [S2]  = ISLAND_SECTION(0.85f, PICK_LEFT, PICK_RIGHT),
     [S3]  = CROSS_SECTION(0.85f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.85f, 2, 0.9f, 3.50f),
+    [S4]  = GAP_SECTION(0.85f, 2, 0.8f, 3.50f),
     [S5]  = CROSS_SECTION(0.85f, 2),
     [S6]  = CROSS_SECTION(0.85f, 2),
     [S7]  = CROSS_SECTION(0.85f, 2),

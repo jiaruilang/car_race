@@ -365,7 +365,7 @@ static int special_heading_hold;
    steer_line() used to clip w at a hard-coded +/-2.0 rad/s. CORNER_W_TEST
    raises that cap ONLY on FOLLOW frames where the corner test fires.
    0 = bit-for-bit the 11-08 framework behaviour. */
-#define STEER_W_LIMIT 20.0f
+#define STEER_W_LIMIT 30.0f
 #define CORNER_W_TEST 1
 #define CORNER_TEST_W_LIMIT 20.0f
 /* course_limit()'s kinematic clamp: |w| <= K*v/TRACK_M. 1.8 was the old
@@ -403,7 +403,6 @@ static int special_heading_hold;
 #define CORNER_ENTER_RUN 6   /* consecutive sensors counted from one edge */
 #define SEARCH_EDGE_RUN 5    /* consecutive sensors from one end to update search direction */
 #define CORNER_PULSE_EXIT_RAD 1.658f   /* ~147 deg: unconditional release */
-#define CORNER_PULSE_MIN_RAD 0.1f /* minimum yaw for predictive release; 0 enables short bends */
 #define CORNER_PULSE_CENTER_MIN 1  /* lit sensors required inside the window */
 #define CORNER_PULSE_COOL_MS 25u  /* re-arm window measured from the TRIGGER frame */
 #if CORNER_ENTER_RUN < 2 || CORNER_ENTER_RUN > 12
@@ -650,15 +649,19 @@ static void track_reset(void){ steer_reset();
 static unsigned course_segment=1, course_pass, course_pending;
 /* 0/1: corners counted, 2: zigzag speed cap active, 3: section finished. */
 static unsigned s10_corner_count;
-static unsigned s4_corner_count;
 static float s4_second_corner_s;
-static int s4_last_corner_side;
+static int s4_second_bend_finished;
+static int s4_second_bend_confirmed;
 static int s10_last_corner_side;
 static uint32_t s10_last_corner_ms;
 static float s10_zigzag_start_s;
 static unsigned course_armed=1, course_clear_ms, course_enter_ms;
 static unsigned course_gap, course_gap_done, course_gap_started, course_gap_seen;
 static unsigned course_straight_ms, course_final, course_done;
+enum { PARK_FORWARD=1, PARK_WAIT, PARK_TURN, PARK_RETURN };
+static unsigned park_still_ms, park_cross_frames;
+static int park_cross_ready;
+static float park_heading;
 static unsigned course_wait_start, course_laps;
 static unsigned course_eight, course_join_armed, course_join_clear, course_join_frames;
 static unsigned course_eight_started;
@@ -669,8 +672,55 @@ static float course_last_line_yaw, course_finish_s, course_eight_s, course_eight
    car RIGHT by COURSE_GAP_TURN_RAD as soon as the line is lost, then holds
    that new heading until the line is reacquired. */
 static float course_gap_target_yaw;
+#include "course_elements.h"
+#if COURSE_ELEMENT_MODE
+static float element_speed;
+static unsigned element_index, element_segment, element_pass, element_hits;
+static float element_start_s;
+static void update_element_speed(int confirmed,int active){
+    const unsigned count=sizeof(course_elements)/sizeof(course_elements[0]);
+    element_speed=COURSE_ELEMENT_DEFAULT_MPS;
+    if(course_wait_start || course_final){element_segment=0;return;}
+    if(element_segment!=course_segment || element_pass!=course_pass){
+        element_segment=course_segment;element_pass=course_pass;
+        element_index=0;element_hits=0;element_start_s=course_last_event_s;
+        while(element_index<count && (course_elements[element_index].segment!=element_segment ||
+              course_elements[element_index].pass!=element_pass))element_index++;
+    }
+    if(element_index>=count)return;
+    const CourseElement *e=&course_elements[element_index];
+    if(element_index+1u<count && e[1].segment==element_segment && e[1].pass==element_pass){
+        int advance;
+        if(e->bends){
+            if(confirmed && element_hits<e->bends)element_hits++;
+            advance=element_hits>=e->bends && !active;
+        }else if(e->kind==ELEMENT_GAP)advance=course_gap_done;
+        else if(e[1].bends)advance=confirmed;
+        else if(e[1].kind==ELEMENT_GAP)advance=course_gap;
+        else advance=e[1].kind==ELEMENT_ISLAND && track_state==BRANCH;
+        if(advance){
+            element_index++;e++;
+            element_start_s=app_s;element_hits=(confirmed && e->bends)?1u:0u;
+        }
+    }
+    element_speed=e->speed;
+    float remaining=e->metres-(app_s-element_start_s);
+    float cross_speed=element_pass<2u ? course_cross_speed[element_segment][element_pass] : 0;
+    if(cross_speed>0 && track_state==CROSS){element_speed=cross_speed;return;}
+    if(cross_speed>0 && remaining<=COURSE_ELEMENT_LOOKAHEAD_M &&
+       (element_index+1u==count || e[1].segment!=element_segment || e[1].pass!=element_pass))
+        element_speed=fminf(element_speed,cross_speed);
+    for(unsigned j=element_index+1u;j<count && remaining<=COURSE_ELEMENT_LOOKAHEAD_M;j++){
+        element_speed=fminf(element_speed,course_elements[j].speed);
+        remaining+=course_elements[j].metres;
+    }
+}
+#endif
 static const CourseSegment *course_spec(void){return &course_map[course_segment-1u];}
 static float course_cruise(void){
+#if COURSE_ELEMENT_MODE
+    if(COURSE_ENABLE && APP_MODE==6 && !course_final)return element_speed;
+#endif
     return COURSE_ENABLE && APP_MODE==6 ? fminf(TEST_SPEED_MPS,course_spec()->speed):TEST_SPEED_MPS;
 }
 static int course_side(void){
@@ -683,7 +733,7 @@ static int course_accept(void){
 }
 static void course_begin(void){
     s10_corner_count=0;s10_last_corner_side=0;
-    s4_corner_count=0;s4_last_corner_side=0;
+    s4_second_bend_confirmed=s4_second_bend_finished=0;
 #if SPECIAL_ISLAND_SINGLE_FORK
     special_heading_hold=0;
 #endif
@@ -707,8 +757,7 @@ static void course_begin(void){
        COURSE_W_LIMIT_K<=0.0f || CORNER_PULSE_W<=0.0f ||
        JUNCTION_HEADING_KP<=0.0f ||
        EIGHT_CROSS_W_CAP<=0.0f || EIGHT_CROSS_W_CAP>STEER_W_LIMIT ||
-       CORNER_PULSE_EXIT_RAD<=0.0f || CORNER_PULSE_MIN_RAD<0.0f ||
-       CORNER_PULSE_MIN_RAD>=CORNER_PULSE_EXIT_RAD ||
+       CORNER_PULSE_EXIT_RAD<=0.0f ||
        COURSE_PARK_SPEED_MPS<=0.0f || COURSE_PARK_SPEED_MPS>TEST_SPEED_MPS ||
        (COURSE_GAP_TURN_DIR!=1 && COURSE_GAP_TURN_DIR!=-1) ||
        ISLAND_OUT_TRIGGER!=1){
@@ -761,7 +810,7 @@ static void course_tick(void){
                 }else course_segment++;
                 segment_fork_hits=0;dbg_fork=0;
                 s10_corner_count=0;s10_last_corner_side=0;
-                s4_corner_count=0;s4_last_corner_side=0;
+                s4_second_bend_confirmed=s4_second_bend_finished=0;
                 course_pass=0;course_start_s=app_s;
                 course_enter_ms=app_elapsed;course_gap_done=0;
                 course_straight_ms=0;course_eight=EIGHT_OFF;
@@ -774,7 +823,7 @@ static void course_tick(void){
    a blank, with a fixed yaw reference and independent distance/time bounds. */
 static int course_gap_control(int total,int groups,float bend,float *v,float *w){
     if(!COURSE_ENABLE)return 0;
-    int after_corners=course_segment==4 && s4_corner_count==2 &&
+    int after_corners=course_segment==4 && s4_second_bend_finished &&
         (track_state==FOLLOW || track_state==SEARCH);
     if(!course_gap && (can_detect_element() || after_corners)){
         if(total && groups==1 && fabsf(bend)<=COURSE_GAP_E_MAX &&
@@ -784,8 +833,9 @@ static int course_gap_control(int total,int groups,float bend,float *v,float *w)
         float s=app_s-course_start_s;
         int straight_entry=can_detect_element() && course_straight_ms>=COURSE_GAP_APPROACH_MS &&
             s>=course_spec()->gap_arm_min_m && s<=course_spec()->gap_arm_max_m;
-        int clear_of_corner=s4_corner_count<2 ||
-            app_s-s4_second_corner_s>=S4_GAP_AFTER_SECOND_CORNER_M;
+        int clear_of_corner=!s4_second_bend_confirmed ||
+            (s4_second_bend_finished &&
+             app_s-s4_second_corner_s>=S4_GAP_AFTER_SECOND_CORNER_M);
         if(!total && course_spec()->gap && !course_gap_done && clear_of_corner &&
            (straight_entry || after_corners)){
             if(track_state==SEARCH)track_enter(FOLLOW);
@@ -818,7 +868,7 @@ static int course_gap_control(int total,int groups,float bend,float *v,float *w)
         rate_i=0;rate_ready=0;
         return 0;
     }
-    *v=fminf(course_cruise(),COURSE_GAP_SPEED);
+    *v=COURSE_ELEMENT_MODE ? course_cruise() : fminf(course_cruise(),COURSE_GAP_SPEED);
     /* Heading hold towards course_gap_target_yaw. With TURN_ENABLE 1 the
        target is offset to the RIGHT, so the car immediately rotates by that
        angle and then runs straight along the new heading (the P loop drives
@@ -1057,7 +1107,7 @@ static void course_limit(float *v,float *w){
     if(course_segment==10 && s10_corner_count==2){
         if(app_s-s10_zigzag_start_s>=S10_ZIGZAG_MIN_M &&
            app_elapsed-s10_last_corner_ms>=S10_ZIGZAG_CLEAR_MS)s10_corner_count=3;
-        else *v=fminf(*v,S10_ZIGZAG_MAX_MPS);
+        else if(!COURSE_ELEMENT_MODE)*v=fminf(*v,S10_ZIGZAG_MAX_MPS);
     }
     int entry_fork=(track_state==FOLLOW || track_state==SEARCH) &&
         !course_s8_straight() && course_accept() && fork_frames;
@@ -1071,12 +1121,6 @@ static void course_limit(float *v,float *w){
         *v=fminf(*v,ISLAND_FORK_MAX_MPS);
     if(CORNER_SLOW_MODE && (corner_pulse_active || track_state==SEARCH))
         *v=fminf(*v,CORNER_MAX_MPS);
-    if(course_final){
-        if(app_s-course_finish_s>=course_spec()->finish_after_last_bar_m){
-            course_done=1;App_Stop();*v=*w=0;return;
-        }
-        *v=fminf(*v,COURSE_PARK_SPEED_MPS);
-    }
     if(*v>0 && !fixed_pulse_output)*w=app_clip(*w,-COURSE_W_LIMIT_K*(*v)/EFFECTIVE_TRACK_M,
                             COURSE_W_LIMIT_K*(*v)/EFFECTIVE_TRACK_M);
 
@@ -1092,6 +1136,58 @@ static int corner_center_seen(const int *starts,const int *ends,int groups){
     return count>=CORNER_PULSE_CENTER_MIN;
 }
 static int scope_search_arc;
+#define SCOPE_BEND_JOIN_MS 20u
+static unsigned scope_bend_frames;
+static uint32_t right_angle_brake_started;
+static int right_angle_braking;
+static int bend_turn_dir, bend_brake_used;
+static unsigned scope_bend_target_deg;
+static uint32_t scope_bend_last_ms;
+static unsigned scope_bend_index, scope_bend_segment, scope_bend_pass;
+static unsigned scope_bend_eight;
+static int scope_bend_in_loop;
+static float scope_bend_start_yaw, scope_bend_last_yaw, scope_bend_exit_rad;
+static volatile float scope_bend_measured_deg;
+
+static unsigned course_bend_target_deg(unsigned segment,unsigned index){
+    /* Net heading change: a 135-degree included angle turns 45 degrees. */
+    static const unsigned char s1[]={45,90,90,90,90,90,45,90,90};
+    static const unsigned char s3_approach[]={90,90,90};
+    static const unsigned char s3_octagon[]={45,45,45,45,45,45,45,45};
+    static const unsigned char s4[]={90,90,90,90};
+    static const unsigned char cross_loop[]={90,90,90};
+    static const unsigned char hexagon[]={60,60,60,60,60};
+    static const unsigned char s8_approach[]={30};
+    static const unsigned char s9_approach[]={60,60};
+    static const unsigned char s9_large_in[]={60};
+    static const unsigned char s9_large_out[]={60,60,60,60};
+    static const unsigned char s10[]={90,90,45,90,90,90,90,90,45,90};
+    switch(segment){
+    case 1:
+        return !course_pass && index<sizeof(s1) ? s1[index] : 0;
+    case 2:
+        return scope_bend_in_loop && index<sizeof(hexagon) ? hexagon[index] : 0;
+    case 3:
+        if(course_pass)return index<sizeof(s3_octagon) ? s3_octagon[index] : 0;
+        return index<sizeof(s3_approach) ? s3_approach[index] : 0;
+    case 4:
+        return !course_pass && index<sizeof(s4) ? s4[index] : 0;
+    case 5: case 6: case 7:
+        return course_pass && index<sizeof(cross_loop) ? cross_loop[index] : 0;
+    case 8:
+        if(scope_bend_in_loop)return index<sizeof(hexagon) ? hexagon[index] : 0;
+        return index<sizeof(s8_approach) ? s8_approach[index] : 0;
+    case 9:
+        if(!scope_bend_in_loop)return index<sizeof(s9_approach) ? s9_approach[index] : 0;
+        if(course_eight==EIGHT_SMALL)return index<sizeof(hexagon) ? hexagon[index] : 0;
+        if(course_eight==EIGHT_LARGE_OUT)
+            return index<sizeof(s9_large_out) ? s9_large_out[index] : 0;
+        return index<sizeof(s9_large_in) ? s9_large_in[index] : 0;
+    case 10:
+        return index<sizeof(s10) ? s10[index] : 0;
+    }
+    return 0;
+}
 static void search_arc(int direction,float *v,float *w){
     scope_search_arc=1;
     *v=course_cruise();
@@ -1219,9 +1315,68 @@ static int corner_coast_ready(int start,int end,int direction){
 }
 
 #endif
+static int search_exit_check(int central,int groups,int edge_run,int wide,
+                             const int *starts,const int *ends,float weight,
+                             float prev_abs,int direction,int *reason){
+    int exit_ok=(SEARCH_EXIT_MODE==0)?central:
+            corner_center_seen(starts,ends,groups);
+    if(SEARCH_EXIT_MODE==2)exit_ok=exit_ok && fabsf(weight)<prev_abs;
+    *reason=exit_ok ? 5 : 4; /* optical or predicted, published on exit */
+#if CORNER_PREDICT_EXIT
+    if(groups==1 && !edge_run && !wide){
+#if CORNER_COAST_EXIT
+        exit_ok |= corner_coast_ready(starts[0],ends[0],direction);
+#else
+        exit_ok |= turn_center_approaching(groups,starts[0],ends[0],direction);
+#endif
+    }else turn_samples=0;
+#endif
+    return exit_ok;
+}
+
+#if SEARCH_SWEEP_TEST
+static unsigned sweep_phase,sweep_exit_ms;
+static int sweep_departed;
+static float sweep_heading;
+static void search_sweep_control(int groups,int total,const int *starts,const int *ends,
+                                 float weight,float prev_abs,float *v,float *w){
+    *v=SEARCH_SWEEP_SPEED_MPS;
+    if(sweep_phase==0 && app_s>=SEARCH_SWEEP_TRIGGER_M){
+        sweep_phase=1;sweep_heading=app_yaw;sweep_departed=0;
+        track_enter(SEARCH);
+    }
+    if(sweep_phase==1){
+        int central=groups==1 && total<=CENTRAL_TOTAL_MAX && fabsf(weight)<CENTRAL_WEIGHT_MAX;
+        int edge_run=groups>0 && ((starts[0]==0 && ends[0]>=CORNER_ENTER_RUN-1) ||
+            (ends[groups-1]==11 && starts[groups-1]<=12-CORNER_ENTER_RUN));
+        int reason=0;
+        if(!corner_center_seen(starts,ends,groups))sweep_departed=1;
+        int found=sweep_departed && search_exit_check(central,groups,edge_run,total==12,
+            starts,ends,weight,prev_abs,SEARCH_SWEEP_DIR,&reason);
+        clear_frames=found ? clear_frames+1u : 0u;
+        if(clear_frames>=SEARCH_EXIT_FRAMES){
+            sweep_phase=2;sweep_exit_ms=app_elapsed;corner_release_reason=reason;
+            track_enter(FOLLOW);
+        }else{
+            state_ms+=5;
+            if(state_ms>SEARCH_TIMEOUT_MS){app_fail(5);return;}
+            *w=SEARCH_SWEEP_DIR*SEARCH_SWEEP_W_RAD_S;
+            return;
+        }
+    }
+    if(sweep_phase==2 && app_elapsed-sweep_exit_ms>=SEARCH_SWEEP_AFTER_MS){App_Stop();return;}
+    if(groups==1){
+        float e=(starts[0]+ends[0])/11.0f-1.0f;
+        float de=app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX);
+        *w=steer_line(e,de,LINE_KP,track_d_ready,STEER_W_LIMIT);
+        app_error_prev=e;track_d_ready=1;
+    }else track_d_ready=0;
+}
+#endif
+
 static void track_control(float *v,float *w){
     scope_search_arc=0;
-    corner_remaining_rad=-1;corner_coast_rad=0;corner_release_reason=0;
+    corner_remaining_rad=-1;corner_coast_rad=0;
     fixed_pulse_output=0;
     int prior_pulse_side=(track_state==FOLLOW && corner_pulse_active) ? corner_pulse_side : 0;
     junction_speed_hold=0;
@@ -1249,6 +1404,10 @@ static void track_control(float *v,float *w){
     float dweight=weight-track_weight_prev;
     float prev_abs=fabsf(track_weight_prev);
     track_weight_prev=weight; /* update before any early return */
+#if SEARCH_SWEEP_TEST
+    search_sweep_control(groups,total,starts,ends,weight,prev_abs,v,w);
+    return;
+#endif
     /* weight/total == segment centre e for one run; dbend is its per-frame
        change, free of line-width changes. Kept before every early return so
        a state switch cannot fake a jump on the frame we come back. */
@@ -1387,7 +1546,7 @@ static void track_control(float *v,float *w){
        even when its edge pattern also qualifies as a corner. */
     int loop_corner=ISLAND_LOOP_USE_CORNER && track_state==BRANCH && island_phase==IS_LOOP &&
         (!ordinary_island || island_entry_gate==ENTRY_CLEAR) && !island_out_pending &&
-        !(ordinary_island && island_out_armed);
+        !island_out_armed;
     int branch_corner=leave_corner || loop_corner;
     int loop_fork=loop_corner && (fork || junction_speed_hold);
     if(loop_fork){
@@ -1422,7 +1581,10 @@ static void track_control(float *v,float *w){
     int corner=0;
     int turning=corner_pulse_active || track_state==SEARCH;
     int optical_release=corner_pulse_active && corner_center_seen(starts,ends,groups);
-    if(!search_continues_corner && !optical_release && corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
+    int hold_corner_trigger=COURSE_RIGHT_ANGLE_TEST &&
+        ((right_angle_braking && app_elapsed-right_angle_brake_started<COURSE_RIGHT_ANGLE_BRAKE_MS) ||
+         (corner_pulse_active && scope_bend_frames>0u && scope_bend_target_deg==90u));
+    if(!hold_corner_trigger && !search_continues_corner && !optical_release && corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
         previous_corner_side=corner_side;
     int corner_confirmed=previous_corner_side &&
         (CORNER_CONFIRM_FRAMES==1 || previous_corner_side==prior_corner);
@@ -1431,12 +1593,6 @@ static void track_control(float *v,float *w){
     if(track_state!=FOLLOW && !branch_corner){
         corner_pulse_active=0;
     }else if(corner_confirmed){
-        if(course_segment==4 && !course_gap_done && s4_corner_count<2 &&
-           corner_side!=s4_last_corner_side){
-            s4_corner_count++;
-            if(s4_corner_count==2)s4_second_corner_s=app_s;
-            s4_last_corner_side=corner_side;
-        }
         if(COURSE_ENABLE && course_segment==10 && s10_corner_count<3){
             if(s10_last_corner_side!=corner_side && s10_corner_count<2){
                 s10_corner_count++;
@@ -1469,21 +1625,33 @@ static void track_control(float *v,float *w){
         float turned=fabsf(app_yaw-corner_entry_yaw);
         /* A visible centre line may release even a very short pulse. */
         int release=optical_release;
+        int mapped_angle=(track_state==FOLLOW || loop_corner) && scope_bend_frames>0u &&
+            app_elapsed-scope_bend_last_ms<=SCOPE_BEND_JOIN_MS && scope_bend_exit_rad>0.0f &&
+            scope_bend_segment==course_segment && scope_bend_pass==course_pass &&
+            scope_bend_eight==course_eight && scope_bend_in_loop==loop_corner;
+        int angle_hit=mapped_angle && -corner_pulse_side*(app_yaw-scope_bend_start_yaw)>=scope_bend_exit_rad;
+        if(angle_hit){release=1;corner_release_reason=6;}
+        int predicted=0;
 #if CORNER_PREDICT_EXIT
         if(track_state!=SEARCH){
             if(groups==1 && !edge_run && !wide){
 #if CORNER_COAST_EXIT
-                int predicted=corner_coast_ready(starts[0],ends[0],-corner_pulse_side);
+                predicted=corner_coast_ready(starts[0],ends[0],-corner_pulse_side);
 #else
-                int predicted=turn_center_approaching(groups,starts[0],ends[0],-corner_pulse_side);
+                predicted=turn_center_approaching(groups,starts[0],ends[0],-corner_pulse_side);
 #endif
-                if(predicted && turned>=CORNER_PULSE_MIN_RAD){release=1;corner_release_reason=1;}
             }else turn_samples=0;
         }
 #endif
+        if(predicted){release=1;corner_release_reason=1;}
         if(turned>=CORNER_PULSE_EXIT_RAD || release){
+            if(COURSE_RIGHT_ANGLE_TEST && mapped_angle){
+                right_angle_brake_started=app_elapsed;
+                right_angle_braking=1;
+                bend_brake_used=1;
+            }
             if(ordinary_loop)ordinary_guard_dir=0;
-            if(optical_release)corner_release_reason=2;
+            if(!predicted && optical_release && !(COURSE_RIGHT_ANGLE_TEST && angle_hit))corner_release_reason=2;
             else if(!release)corner_release_reason=3;
             corner_pulse_active=0;
         }else corner=1;
@@ -1506,6 +1674,14 @@ static void track_control(float *v,float *w){
             (turning || prior_cross || (uint32_t)(app_elapsed-corner_last_trigger_ms)>=CORNER_CROSS_BLOCK_MS);
         if(previous_cross_hit && prior_cross){
             course_enter_element(CP_CROSS);if(!app_running)return;
+            if(COURSE_ENABLE && !FORK_TEST_MODE && course_segment==10u &&
+               course_laps+1u>=COURSE_RACE_LAPS && course_pass+1u>=course_spec()->passes){
+                course_finish_s=app_s;park_heading=app_yaw;
+                course_final=PARK_FORWARD;
+                park_still_ms=park_cross_frames=0;park_cross_ready=0;
+                track_enter(FOLLOW);
+                *v=course_cruise();*w=0;return;
+            }
             track_enter(CROSS);
         }
         else if(fork_frames>=((COURSE_ENABLE && course_segment==8u)?FORK_CONFIRM_COUNT(ISLAND_SPECIAL_ENTRY_FORK_FRAMES):FORK_CONFIRM_COUNT(FORK_FRAMES)) && course_accept() && !course_s8_straight()){
@@ -1533,13 +1709,11 @@ static void track_control(float *v,float *w){
 #endif
     }
     if(prior_pulse_side && track_state==SEARCH){
-        if(course_segment==4 && s4_corner_count)s4_last_corner_side=prior_pulse_side;
         if(course_segment==10 && s10_corner_count)s10_last_corner_side=prior_pulse_side;
         search_continues_corner=1;
     }
     if(!corner_raw && !search_continues_corner){
         s10_last_corner_side=0;
-        s4_last_corner_side=0;
     }
     if(track_state!=FOLLOW)state_ms+=5;
     /* Island sub-state machine: a 2->1 fall-back happens at BOTH the entrance
@@ -1729,19 +1903,8 @@ static void track_control(float *v,float *w){
         int exit_ok;
         int search_release_reason=0;
         if(track_state==SEARCH){
-            exit_ok=(SEARCH_EXIT_MODE==0)?central:
-                    corner_center_seen(starts,ends,groups);
-            if(SEARCH_EXIT_MODE==2)exit_ok=exit_ok && fabsf(weight)<prev_abs;
-            search_release_reason=exit_ok ? 5 : 4; /* optical or predicted, published on exit */
-#if CORNER_PREDICT_EXIT
-            if(groups==1 && !edge_run && !wide){
-#if CORNER_COAST_EXIT
-                exit_ok |= corner_coast_ready(starts[0],ends[0],SEARCH_SPIN_DIR*edge_side);
-#else
-                exit_ok |= turn_center_approaching(groups,starts[0],ends[0],SEARCH_SPIN_DIR*edge_side);
-#endif
-            }else turn_samples=0;
-#endif
+            exit_ok=search_exit_check(central,groups,edge_run,wide,starts,ends,
+                                      weight,prev_abs,SEARCH_SPIN_DIR*edge_side,&search_release_reason);
             if(previous_cross_hit || fork_frames>0)exit_ok=0;
         }else if(track_state==BRANCH){
             /* The island exit is owned by island_phase (IS_LEAVE), not by a
@@ -1773,7 +1936,7 @@ static void track_control(float *v,float *w){
     }
     if(track_state==CROSS){
         if(state_ms>CROSS_TIMEOUT_MS){if(COURSE_ENABLE){app_fail(12);return;}if(TRACK_RECOVER_ON_TIMEOUT)track_enter(FOLLOW);else app_fail(5);return;}
-        *v=fminf(TRACK_CRUISE,0.30f);
+        *v=COURSE_ELEMENT_MODE ? TRACK_CRUISE : fminf(TRACK_CRUISE,0.30f);
         *w=app_clip(TRACK_HEADING_KP*(entry_yaw-app_yaw),-0.8f,0.8f);
         return;
     }
@@ -1933,9 +2096,21 @@ static void app_start(void){
     app_s=app_yaw=app_il=app_ir=app_error_prev=app_line_prev=0;
     app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
     track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
+    scope_bend_frames=0;
+#if COURSE_ELEMENT_MODE
+    element_segment=0;
+#endif
+    right_angle_braking=0;
+    corner_release_reason=0;
+    scope_bend_index=scope_bend_segment=scope_bend_pass=0;
+    scope_bend_eight=0;scope_bend_in_loop=0;
+    scope_bend_measured_deg=0.0f;
     mode7_active=0;mode7_steady_ms=0;mode7_run_ms=0;
     app_last_completed=app_ms;app_running=1;
     elem_test_reset();course_begin();
+#if SEARCH_SWEEP_TEST
+    sweep_phase=0;sweep_heading=app_yaw;
+#endif
 }
 static void app_control(float gz_rad){
     float v=0,w=0,tl,tr;
@@ -1982,11 +2157,128 @@ static void app_control(float gz_rad){
         /* Inside the settle window the floor must be released, otherwise the
            wheels never stop and the settle check above can never pass. */
         floor_release=(fabsf(e)<TURN_TOL_RAD);
+    }else if(APP_MODE==6 && course_final){
+        v=w=0;
+        if(course_final==PARK_FORWARD){
+            if(app_s-course_finish_s>=COURSE_PARK_DISTANCE_M)course_final=PARK_WAIT;
+            else{
+                v=course_cruise();
+                w=app_clip(TRACK_HEADING_KP*(park_heading-app_yaw),-0.8f,0.8f);
+            }
+        }else if(course_final==PARK_WAIT){
+            if(fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f)park_still_ms+=5;
+            else park_still_ms=0;
+            if(park_still_ms>=COURSE_PARK_WAIT_MS){
+                park_heading=app_yaw+PI_F;course_final=PARK_TURN;
+            }
+        }else if(course_final==PARK_TURN){
+            float e=park_heading-app_yaw;
+            if(e>=TURN_TOL_RAD)w=2.0f*COURSE_PARK_TURN_WHEEL_MPS/EFFECTIVE_TRACK_M;
+            else if(fabsf(app_vl)<0.015f && fabsf(app_vr)<0.015f){
+                course_final=PARK_RETURN;track_d_ready=0;
+            }
+        }else{
+            int hits=0,sum=0;
+            for(int i=0;i<12;i++)if(MUX_GET_CHANNEL(app_mask,i)){hits++;sum+=i;}
+            if(hits>0 && hits<12)park_cross_ready=1;
+            park_cross_frames=(park_cross_ready && hits==12)?park_cross_frames+1u:0u;
+            if(park_cross_frames>=2u){course_done=1;App_Stop();return;}
+            v=COURSE_PARK_SPEED_MPS;
+            if(hits>0 && hits<12){
+                float e=2.0f*sum/(11.0f*hits)-1.0f;
+                float de=app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX);
+                w=steer_line(e,de,LINE_KP,track_d_ready,STEER_W_LIMIT);
+                app_error_prev=e;track_d_ready=1;
+            }else track_d_ready=0;
+        }
     }else if(APP_MODE==6){
+#if SEARCH_SWEEP_TEST
+        track_control(&v,&w);if(!app_running)return;
+#else
         course_tick();if(!app_running)return;
+#if COURSE_ELEMENT_MODE
+        update_element_speed(0,scope_bend_frames>=2u);
+#endif
         track_control(&v,&w);
+        int in_loop=track_state==BRANCH && island_phase==IS_LOOP;
+        int island_exit_in_progress=track_state==BRANCH &&
+            (island_out_armed || island_out_pending ||
+             island_phase==IS_TURN_OUT || island_phase==IS_LEAVE);
+        int bend_route_changed=scope_bend_segment!=course_segment || scope_bend_pass!=course_pass ||
+            scope_bend_eight!=course_eight || scope_bend_in_loop!=in_loop;
+        if(bend_route_changed || island_exit_in_progress ||
+           app_elapsed-scope_bend_last_ms>SCOPE_BEND_JOIN_MS){
+            if(!bend_route_changed && course_segment==4u && course_pass==0u &&
+               scope_bend_frames>=2u && scope_bend_index==2u){
+                s4_second_corner_s=app_s;
+                s4_second_bend_finished=1;
+            }
+            if(scope_bend_frames>=2u)
+                scope_bend_measured_deg=fabsf(scope_bend_last_yaw-scope_bend_start_yaw)*57.29578f;
+            scope_bend_frames=0;
+            if(bend_route_changed)scope_bend_index=0;
+            scope_bend_segment=course_segment;scope_bend_pass=course_pass;
+            scope_bend_eight=course_eight;scope_bend_in_loop=in_loop;
+        }
+#if COURSE_ELEMENT_MODE
+        int bend_confirmed_now=0;
+#endif
+        if(app_running && !island_exit_in_progress &&
+           (corner_pulse_active || track_state==SEARCH || scope_search_arc)){
+            if(!scope_bend_frames){
+                scope_bend_start_yaw=app_yaw;
+                scope_bend_exit_rad=0.0f;
+                bend_turn_dir=w>0.0f ? 1 : (w<0.0f ? -1 : 0);
+                bend_brake_used=0;
+                unsigned target=course_bend_target_deg(course_segment,scope_bend_index);
+                scope_bend_target_deg=target;
+                if(target==90u && target>COURSE_CORNER_EXIT_LEAD_DEG)
+                    scope_bend_exit_rad=(target-COURSE_CORNER_EXIT_LEAD_DEG)*0.017453293f;
+            }else if(scope_bend_frames==1u){
+                scope_bend_index++;
+                if(course_segment==4u && course_pass==0u && scope_bend_index==2u)
+                    s4_second_bend_confirmed=1;
+#if COURSE_ELEMENT_MODE
+                bend_confirmed_now=1;
+#endif
+            }
+            if(scope_bend_frames<2u)scope_bend_frames++;
+            scope_bend_last_ms=app_elapsed;
+            scope_bend_last_yaw=app_yaw;
+        }
         if(!app_running || app_lost)return;
+#if COURSE_ELEMENT_MODE
+        float previous_element_speed=element_speed;
+        update_element_speed(bend_confirmed_now,scope_bend_frames>=2u);
+        if(v==previous_element_speed)v=element_speed;
+#endif
         course_limit(&v,&w);if(!app_running)return;
+#if COURSE_ELEMENT_MODE
+        if(fixed_pulse_output && (corner_pulse_active || scope_search_arc))
+            w=copysignf(v/COURSE_ELEMENT_RADIUS_M,w);
+#endif
+#if COURSE_RIGHT_ANGLE_TEST
+        if(scope_bend_frames>0u && scope_bend_target_deg==90u){
+            if(!COURSE_ELEMENT_MODE)v=fminf(v,COURSE_RIGHT_ANGLE_MAX_MPS);
+            if(!COURSE_ELEMENT_MODE && fixed_pulse_output && (corner_pulse_active || scope_search_arc))
+                w=copysignf(COURSE_RIGHT_ANGLE_PULSE_W,w);
+            if(scope_search_arc && !bend_brake_used && scope_bend_exit_rad>0.0f &&
+               bend_turn_dir*(app_yaw-scope_bend_start_yaw)>=scope_bend_exit_rad){
+                right_angle_braking=1;
+                right_angle_brake_started=app_elapsed;
+                bend_brake_used=1;
+                corner_release_reason=6;
+            }
+        }
+        if(right_angle_braking){
+            if(app_elapsed-right_angle_brake_started>=COURSE_RIGHT_ANGLE_BRAKE_MS ||
+               bend_route_changed || island_exit_in_progress || dbg_fork || course_gap ||
+               (track_state!=FOLLOW && track_state!=SEARCH && !in_loop))
+                right_angle_braking=0;
+            else w=0.0f;
+        }
+#endif
+#endif
     }else if(APP_MODE==7){
         float e7;
         steer_test_control(&w,&e7);
@@ -2023,7 +2315,7 @@ static void app_control(float gz_rad){
         if(tl!=0.0f)tl=copysignf(fmaxf(fabsf(tl),MIN_SPEED_MPS),tl);
         if(tr!=0.0f)tr=copysignf(fmaxf(fabsf(tr),MIN_SPEED_MPS),tr);
     }
-    if(APP_MODE==6 && MIN_SPEED_FLOOR_MODE6 && MIN_SPEED_MPS>0){
+    if(APP_MODE==6 && course_final!=PARK_TURN && MIN_SPEED_FLOOR_MODE6 && MIN_SPEED_MPS>0){
         float outer=fmaxf(fabsf(tl),fabsf(tr));
         if(outer>0 && outer<MIN_SPEED_MPS){
             float scale=MIN_SPEED_MPS/outer;
@@ -2076,7 +2368,7 @@ static void app_log(void){
     if(app_tx_pos<app_tx_len && __HAL_UART_GET_FLAG(&huart3,UART_FLAG_TXE)){
         huart3.Instance->DR=(uint8_t)app_tx[app_tx_pos++];
     }
-    uint32_t period=APP_SCOPE?((FORK_TEST_MODE || APP_SCOPE_STATE==6)?5u:APP_SCOPE_PERIOD_MS):200u;
+    uint32_t period=APP_SCOPE?((SEARCH_SWEEP_TEST || FORK_TEST_MODE || APP_SCOPE_STATE==6)?5u:APP_SCOPE_PERIOD_MS):200u;
     if(app_tx_pos>=app_tx_len && (uint32_t)(HAL_GetTick()-app_last_log)>=period){
         int n;app_last_log=HAL_GetTick();
         if(APP_SCOPE){
@@ -2088,6 +2380,12 @@ static void app_log(void){
             n=snprintf(app_tx,sizeof(app_tx),"%d,%d,%u,%u,%d,%u,%u,%u\n",
                 dbg_groups,dbg_fork,segment_fork_hits,fork_test_falls,track_state*10+island_phase,
                 (unsigned)junction.phase,course_eight,app_fault?app_fault:(course_done?100u:0u));
+#elif SEARCH_SWEEP_TEST
+            n=snprintf(app_tx,sizeof(app_tx),"%lu,%u,%ld,%ld,%ld,%ld,%ld,%u\n",
+                (unsigned long)app_elapsed,sweep_phase,(long)(dbg_w*1000),(long)(steer_gyro*1000),
+                (long)((app_yaw-sweep_heading)*1000),(long)(app_s*1000),
+                (long)((app_vl+app_vr)*500),corner_release_reason);
+            corner_release_reason=0;
 #elif APP_SCOPE_STATE == 6
             n=snprintf(app_tx,sizeof(app_tx),"%lu,%d,%ld,%ld,%ld,%ld,%ld,%u\n",
                 (unsigned long)app_elapsed,
@@ -2095,15 +2393,17 @@ static void app_log(void){
                 track_state==CROSS ? 4 : track_state==BRANCH ? 5 : 0,(long)(dbg_w*1000),
                 (long)(steer_gyro*1000),(long)(app_yaw*1000),
                 (long)(corner_remaining_rad*1000),(long)(corner_coast_rad*1000),corner_release_reason);
+            /* Consume the latest exit only after it is in the outgoing row. */
+            corner_release_reason=0;
 #elif APP_SCOPE_STATE == 5
             /* COURSE segment diagnostics (was STATE 3 in the 11-08 framework).
                CH1 segment; CH2 completed passes; CH3 element state;
                CH4 gap active/done (1/2); CH5 eight phase; CH6 segment mm;
-               CH7 fault; CH8 fork rising edges in this segment. */
+               CH7 fault; CH8 confirmed corner/search bend (40), otherwise 0. */
             n=snprintf(app_tx,sizeof(app_tx),"%u,%u,%d,%u,%u,%ld,%u,%u\n",
-              course_segment,course_pass,track_state*10+island_phase,
+              course_segment,course_pass,scope_search_arc ? SEARCH*10 : track_state*10+island_phase,
               course_gap?1u:(course_gap_done?2u:0u),course_eight,
-              (long)((app_s-course_start_s)*1000),app_fault,segment_fork_hits);
+              (long)((app_s-course_start_s)*1000),app_fault,scope_bend_frames>=2u ? 40u : 0u);
 #elif APP_SCOPE_STATE == 4
             n=elem_test_csv(app_tx,(unsigned)sizeof(app_tx));
 #elif APP_SCOPE_STATE == 3
