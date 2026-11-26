@@ -213,9 +213,6 @@ static int app_parameters_ok(void){
 #define BEND_STRAIGHT_E 0.35f
 /* ---- Direction latching ---- */
 #define SIDE_ENABLE 1         /* update search direction from a single edge run */
-/* SEARCH now reuses CORNER_PULSE_W, so the lost-line arc and the corner
-   pulse can never drift apart. The old SEARCH_SPIN_W is gone: change the
-   shared rate in the corner block instead. */
 #define SEARCH_SPIN_DIR -1    /* +1/-1: flip if SEARCH spins away from the line */
 /* ---- Exit from a special state ---- */
 #define EXIT_FRAMES 3         /* consecutive valid frames before returning to FOLLOW */
@@ -269,7 +266,7 @@ static int app_parameters_ok(void){
 #define BRANCH_TWO_MAX_MS 400u   /* after the fall-back, turn anyway if no split */
 /* ---- Exit turn: smaller than the entrance pulse, and follow the RIGHT
        segment of the two-segment pattern while leaving the island. ---- */
-#define ISLAND_TURN_OUT_W 2.0f   /* exit pulse rate; entrance uses BRANCH_TURN_W 1.2 */
+#define ISLAND_TURN_OUT_W 2.5f   /* exit pulse rate; entrance uses BRANCH_TURN_W 1.2 */
 #define ISLAND_TURN_OUT_MS 200u  /* exit pulse duration, independent of BRANCH_TURN_MS */
 /* After the group-count fall-back, the two-segment pattern reappears during
    the final turn. Follow the RIGHT one then; IS_LOOP is never affected. */
@@ -304,6 +301,11 @@ static int island_phase, island_fall_frames, island_out_armed;
 static int island_out_pending;
 static unsigned exit_single_ms;
 static float island_exit_pulse_yaw;
+static float island_entry_pulse_yaw;
+static float search_pulse_yaw;
+static int search_pulse_dir;
+static int search_pulse_taper_dir;
+static uint32_t search_pulse_last_ms;
 static float ordinary_guard_yaw;
 static int ordinary_guard_dir, ordinary_search_active;
 static unsigned island_out_frames; /* consecutive fork frames for the exit arm */
@@ -553,6 +555,13 @@ static int island_pulse_centered(int start,int end){
     return hi-lo+1>=3;
 }
 
+/* Keep the early turn near full rate, with a progressively steeper taper. */
+static float pulse_angle_scale(int direction,float start_yaw){
+    float turned=direction*(app_yaw-start_yaw);
+    float progress=app_clip(turned/COURSE_PULSE_TAPER_RAD,0.0f,1.0f);
+    return 1.0f-progress*progress*progress;
+}
+
 /* Called once per loop frame, including frames where the line is lost.
    Keep the last trigger heading/direction after an ordinary pulse exit:
    subsequent line following can still earn the 30-degree rearm latch. */
@@ -584,7 +593,8 @@ static int island_pulse_update(int visible,float e,int centered,float *w){
         island_pulse.start_yaw=app_yaw;
         island_pulse.retrigger_angle_seen=0;
     }
-    *w=island_pulse.direction*ISLAND_PULSE_W;
+    *w=island_pulse.direction*ISLAND_PULSE_W*
+        pulse_angle_scale(island_pulse.direction,island_pulse.start_yaw);
     return 1;
 }
 /* Three consecutive single-run frames arm element recognition for this SEARCH. */
@@ -602,6 +612,7 @@ static unsigned fit_count;
 #endif
 #endif
 static void track_enter(int state){
+    search_pulse_dir=0;
 #if CORNER_PREDICT_EXIT
     turn_samples=0;
 #endif
@@ -1107,12 +1118,13 @@ static int ordinary_fork_speed_limit(void){
     return course_segment!=8u && course_eight!=EIGHT_SMALL && !small_ring_junction;
 }
 static int fixed_pulse_output;
+static int scope_search_arc;
 static void course_limit(float *v,float *w){
     if(!COURSE_ENABLE)return;
     if(*v>0)*v=fminf(*v,course_cruise());
     /* Preserve the direction of line reacquisition but drive an arc. The old
        SEARCH had v=0 and spun in place; all course-mode turns stay forward. */
-    if(track_state==SEARCH){*v=course_cruise();}
+    if(scope_search_arc)*v=fminf(*v,course_cruise()*SEARCH_SPEED_RATIO);
     if(course_segment==10 && s10_corner_count==2){
         if(app_s-s10_zigzag_start_s>=S10_ZIGZAG_MIN_M &&
            app_elapsed-s10_last_corner_ms>=S10_ZIGZAG_CLEAR_MS)s10_corner_count=3;
@@ -1144,7 +1156,6 @@ static int corner_center_seen(const int *starts,const int *ends,int groups){
             if(i>=CENTER_FIRST_INDEX && i<=CENTER_LAST_INDEX)count++;
     return count>=CORNER_PULSE_CENTER_MIN;
 }
-static int scope_search_arc;
 #define SCOPE_BEND_JOIN_MS 20u
 static unsigned scope_bend_frames;
 static uint32_t right_angle_brake_started;
@@ -1198,9 +1209,15 @@ static unsigned course_bend_target_deg(unsigned segment,unsigned index){
     return 0;
 }
 static void search_arc(int direction,float *v,float *w){
+    if(direction!=search_pulse_dir || app_elapsed-search_pulse_last_ms!=5u){
+        search_pulse_yaw=app_yaw;
+        search_pulse_taper_dir=direction;
+    }
+    search_pulse_dir=direction;
+    search_pulse_last_ms=app_elapsed;
     scope_search_arc=1;
     *v=course_cruise();
-    *w=direction*CORNER_PULSE_W;
+    *w=direction*SEARCH_PULSE_W;
     fixed_pulse_output=1;
 }
 #if CORNER_PREDICT_EXIT
@@ -1344,50 +1361,41 @@ static int search_exit_check(int central,int groups,int edge_run,int wide,
 }
 
 #if SEARCH_SWEEP_TEST
-static unsigned sweep_phase,sweep_exit_ms;
-static int sweep_departed;
+static unsigned sweep_phase;
 static float sweep_heading;
 static void search_sweep_control(int groups,int total,const int *starts,const int *ends,
                                  float weight,float prev_abs,float *v,float *w){
-    *v=SEARCH_SWEEP_SPEED_MPS;
-    if(sweep_phase==0 && app_s>=SEARCH_SWEEP_TRIGGER_M){
-        sweep_phase=1;sweep_heading=app_yaw;sweep_departed=0;
+    if(sweep_phase==0){
+        sweep_phase=1;sweep_heading=app_yaw;
         track_enter(SEARCH);
     }
-    if(sweep_phase==1){
-        int central=groups==1 && total<=CENTRAL_TOTAL_MAX && fabsf(weight)<CENTRAL_WEIGHT_MAX;
-        int edge_run=groups>0 && ((starts[0]==0 && ends[0]>=CORNER_ENTER_RUN-1) ||
-            (ends[groups-1]==11 && starts[groups-1]<=12-CORNER_ENTER_RUN));
-        int reason=0;
-        if(!corner_center_seen(starts,ends,groups))sweep_departed=1;
-        int found=sweep_departed && search_exit_check(central,groups,edge_run,total==12,
-            starts,ends,weight,prev_abs,SEARCH_SWEEP_DIR,&reason);
-        clear_frames=found ? clear_frames+1u : 0u;
-        if(clear_frames>=SEARCH_EXIT_FRAMES){
-            sweep_phase=2;sweep_exit_ms=app_elapsed;corner_release_reason=reason;
-            track_enter(FOLLOW);
-        }else{
-            state_ms+=5;
-            if(state_ms>SEARCH_TIMEOUT_MS){app_fail(5);return;}
-            *w=SEARCH_SWEEP_DIR*SEARCH_SWEEP_W_RAD_S;
-            return;
-        }
+    int central=groups==1 && total<=CENTRAL_TOTAL_MAX && fabsf(weight)<CENTRAL_WEIGHT_MAX;
+    int edge_run=groups>0 && ((starts[0]==0 && ends[0]>=CORNER_ENTER_RUN-1) ||
+        (ends[groups-1]==11 && starts[groups-1]<=12-CORNER_ENTER_RUN));
+    int reason=0;
+    int found=search_exit_check(central,groups,edge_run,total==12,
+        starts,ends,weight,prev_abs,SEARCH_SWEEP_DIR,&reason);
+    clear_frames=found ? clear_frames+1u : 0u;
+    if(clear_frames>=SEARCH_EXIT_FRAMES){
+        sweep_phase=2;corner_release_reason=reason;
+        dbg_v=dbg_w=0.0f;
+        App_Stop();return;
     }
-    if(sweep_phase==2 && app_elapsed-sweep_exit_ms>=SEARCH_SWEEP_AFTER_MS){App_Stop();return;}
-    if(groups==1){
-        float e=(starts[0]+ends[0])/11.0f-1.0f;
-        float de=app_clip((e-app_error_prev)/DT,-LINE_D_MAX,LINE_D_MAX);
-        *w=steer_line(e,de,LINE_KP,track_d_ready,STEER_W_LIMIT);
-        app_error_prev=e;track_d_ready=1;
-    }else track_d_ready=0;
+    state_ms+=5;
+    if(state_ms>SEARCH_TIMEOUT_MS){app_fail(5);return;}
+    *v=SEARCH_SWEEP_SPEED_MPS;
+    *w=SEARCH_SWEEP_DIR*SEARCH_SWEEP_W_RAD_S*pulse_angle_scale(SEARCH_SWEEP_DIR,sweep_heading);
 }
 #endif
 
+static unsigned scope_corner_raw;
 static void track_control(float *v,float *w){
+    scope_corner_raw=0;
     scope_search_arc=0;
     corner_remaining_rad=-1;corner_coast_rad=0;
     fixed_pulse_output=0;
-    int prior_pulse_side=(track_state==FOLLOW && corner_pulse_active) ? corner_pulse_side : 0;
+    int prior_pulse_side=corner_pulse_active ? corner_pulse_side : 0;
+    float prior_pulse_yaw=corner_entry_yaw;
     junction_speed_hold=0;
     small_ring_junction=0;
     int prior_corner=previous_corner_side, prior_cross=previous_cross_hit;
@@ -1571,6 +1579,7 @@ static void track_control(float *v,float *w){
     /* Publish before every early return below, so all control paths in
        this tick report the same fresh pattern snapshot to app_log(). */
     dbg_groups=groups;dbg_total=total;dbg_fork=fork;dbg_corner=corner_raw;
+    scope_corner_raw=corner_raw;
     if(track_state==FOLLOW && groups==1 && total>0 &&
        total<=CENTRAL_TOTAL_MAX && fabsf(bend)<BEND_STRAIGHT_E){
         if(straight_ms<BEND_STRAIGHT_MS+5u)straight_ms+=5;
@@ -1588,12 +1597,22 @@ static void track_control(float *v,float *w){
         }
     }
     int corner=0;
+    int resume_corner=track_state==SEARCH && search_continues_corner &&
+        total>0 && !fork && !wide;
+    if(resume_corner){
+        int resumed_side=-search_pulse_taper_dir;
+        float resumed_yaw=search_pulse_yaw;
+        track_enter(FOLLOW);
+        corner_pulse_active=1;
+        corner_pulse_side=resumed_side;
+        corner_entry_yaw=resumed_yaw;
+    }
     int turning=corner_pulse_active || track_state==SEARCH;
     int optical_release=corner_pulse_active && corner_center_seen(starts,ends,groups);
     int hold_corner_trigger=COURSE_RIGHT_ANGLE_TEST &&
         ((right_angle_braking && app_elapsed-right_angle_brake_started<COURSE_RIGHT_ANGLE_BRAKE_MS) ||
          (corner_pulse_active && scope_bend_frames>0u && scope_bend_target_deg==90u));
-    if(!hold_corner_trigger && !search_continues_corner && !optical_release && corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
+    if(!resume_corner && !hold_corner_trigger && !search_continues_corner && !optical_release && corner_raw && !corner_pulse_cool_ms && (can_detect_element() || branch_corner))
         previous_corner_side=corner_side;
     int corner_confirmed=previous_corner_side &&
         (CORNER_CONFIRM_FRAMES==1 || previous_corner_side==prior_corner);
@@ -1718,6 +1737,10 @@ static void track_control(float *v,float *w){
 #endif
     }
     if(prior_pulse_side && track_state==SEARCH){
+        search_pulse_yaw=prior_pulse_yaw;
+        search_pulse_taper_dir=-prior_pulse_side;
+        search_pulse_dir=SEARCH_SPIN_DIR*edge_side;
+        search_pulse_last_ms=app_elapsed-5u;
         if(course_segment==10 && s10_corner_count)s10_last_corner_side=prior_pulse_side;
         search_continues_corner=1;
     }
@@ -1789,6 +1812,7 @@ static void track_control(float *v,float *w){
             if(trigger){
                 if(ordinary_island)island_entry_gate=ENTRY_CLEAR;
                 island_phase=IS_TURN_IN;island_phase_start=state_ms;
+                island_entry_pulse_yaw=app_yaw;
                 island_two_wait=0;island_two_frames=0;
             }
         }else if(island_phase==IS_TURN_IN){
@@ -1972,6 +1996,12 @@ static void track_control(float *v,float *w){
                 *v=TRACK_CRUISE;return;
             }
             if(island_phase==IS_LOOP && !island_out_pending){
+                if(prior_pulse_side){
+                    search_pulse_yaw=prior_pulse_yaw;
+                    search_pulse_taper_dir=-prior_pulse_side;
+                    search_pulse_dir=d*ISLAND_SIDE;
+                    search_pulse_last_ms=app_elapsed-5u;
+                }
                 search_arc(d*ISLAND_SIDE,v,w);
                 return;
             }
@@ -2092,7 +2122,10 @@ static void track_control(float *v,float *w){
         if(island_phase==IS_TURN_IN)dir=BRANCH_TURN_DIR;
         else if(island_phase==IS_TURN_OUT){dir=ISLAND_OUT_DIR;turn_w=ISLAND_TURN_OUT_W;}
         if(dir){
-            float pulse_w=dir*ISLAND_SIDE*turn_w;
+            int direction=dir*ISLAND_SIDE;
+            float pulse_w=direction*turn_w;
+            if(island_phase==IS_TURN_IN)
+                pulse_w*=pulse_angle_scale(direction,island_entry_pulse_yaw);
             if(!(ordinary_island && island_phase==IS_TURN_OUT))pulse_w+=*w;
             *w=app_clip(pulse_w,-STEER_W_LIMIT,STEER_W_LIMIT);
             if(!FORK_TEST_MODE && BRANCH_TURN_V>0.0f)*v=fminf(*v,BRANCH_TURN_V);
@@ -2279,13 +2312,13 @@ static void app_control(float gz_rad){
 #endif
         course_limit(&v,&w);if(!app_running)return;
 #if COURSE_ELEMENT_MODE
-        if(fixed_pulse_output && (corner_pulse_active || scope_search_arc))
+        if(fixed_pulse_output && corner_pulse_active && !scope_search_arc)
             w=copysignf(v/COURSE_ELEMENT_RADIUS_M,w);
 #endif
 #if COURSE_RIGHT_ANGLE_TEST
         if(scope_bend_frames>0u && scope_bend_target_deg==90u){
             if(!COURSE_ELEMENT_MODE)v=fminf(v,COURSE_RIGHT_ANGLE_MAX_MPS);
-            if(!COURSE_ELEMENT_MODE && fixed_pulse_output && (corner_pulse_active || scope_search_arc))
+            if(!COURSE_ELEMENT_MODE && fixed_pulse_output && corner_pulse_active && !scope_search_arc)
                 w=copysignf(COURSE_RIGHT_ANGLE_PULSE_W,w);
             if(scope_search_arc && !bend_brake_used && scope_bend_exit_rad>0.0f &&
                bend_turn_dir*(app_yaw-scope_bend_start_yaw)>=scope_bend_exit_rad){
@@ -2303,6 +2336,10 @@ static void app_control(float gz_rad){
             else w=0.0f;
         }
 #endif
+        if(fixed_pulse_output && scope_search_arc)
+            w*=pulse_angle_scale(search_pulse_taper_dir,search_pulse_yaw);
+        else if(fixed_pulse_output && corner_pulse_active)
+            w*=pulse_angle_scale(-corner_pulse_side,corner_entry_yaw);
 #endif
     }else if(APP_MODE==7){
         float e7;
@@ -2423,11 +2460,11 @@ static void app_log(void){
 #elif APP_SCOPE_STATE == 5
             /* COURSE segment diagnostics (was STATE 3 in the 11-08 framework).
                CH1 segment; CH2 completed passes; CH3 element state;
-               CH4 gap active/done (1/2); CH5 eight phase; CH6 segment mm;
+               CH4 raw corner hit (0/1); CH5 eight phase; CH6 segment mm;
                CH7 fault; CH8 confirmed corner/search bend (40), otherwise 0. */
             n=snprintf(app_tx,sizeof(app_tx),"%u,%u,%d,%u,%u,%ld,%u,%u\n",
               course_segment,course_pass,scope_search_arc ? SEARCH*10 : track_state*10+island_phase,
-              course_gap?1u:(course_gap_done?2u:0u),course_eight,
+              scope_corner_raw,course_eight,
               (long)((app_s-course_start_s)*1000),app_fault,scope_bend_frames>=2u ? 40u : 0u);
 #elif APP_SCOPE_STATE == 4
             n=elem_test_csv(app_tx,(unsigned)sizeof(app_tx));

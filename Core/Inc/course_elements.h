@@ -6,7 +6,7 @@
    Adjacent tangent lengths are deducted from dimensioned vertex distances.
    Compound lengths are nominal; the next checkpoint re-anchors odometry. */
 #ifndef COURSE_ELEMENT_MODE
-#define COURSE_ELEMENT_MODE 1
+#define COURSE_ELEMENT_MODE 0
 #endif
 #define COURSE_ELEMENT_DEFAULT_MPS 0.83f
 #define COURSE_START_ZONE_MPS 1.5f /* before the start stripe */

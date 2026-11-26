@@ -25,11 +25,10 @@
 #ifndef SEARCH_SWEEP_TEST
 #define SEARCH_SWEEP_TEST 0
 #endif
-#define SEARCH_SWEEP_SPEED_MPS 0.60f
-#define SEARCH_SWEEP_W_RAD_S 12.5f
-#define SEARCH_SWEEP_TRIGGER_M 0.40f /* from the starting position */
+#define SEARCH_SWEEP_SPEED_MPS 0.0f
+#define SEARCH_SWEEP_W_RAD_S 8.5f
 #define SEARCH_SWEEP_DIR 1 /* +1 left, -1 right */
-#define SEARCH_SWEEP_AFTER_MS 250u
+#define COURSE_PULSE_TAPER_RAD 1.659f /* zero at 90 degrees */
 #define COURSE_TOTAL_MS 480000u
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
@@ -55,7 +54,7 @@
      re-acquires too early      -> increase COURSE_GAP_MIN_M
      turns the wrong way        -> set DIR -1                              */
 #define COURSE_GAP_TURN_ENABLE 1   /* 1 = new right-turn behaviour; 0 = old straight */
-#define COURSE_GAP_TURN_RAD 0.75f  /* target yaw offset, rad (~20 deg) */
+#define COURSE_GAP_TURN_RAD 0.60f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
@@ -66,8 +65,10 @@
 #ifndef CORNER_SLOW_MODE
 #define CORNER_SLOW_MODE 0 /* 0: A, cruise through turns; 1: B, apply corner speed cap */
 #endif
-#define CORNER_A_PULSE_W 11.8f  /* rad/s, corner and SEARCH */
-#define CORNER_B_PULSE_W 7.5f /* rad/s, corner and SEARCH */
+#define CORNER_A_PULSE_W 12.8f  /* rad/s, corner */
+#define CORNER_B_PULSE_W 7.5f /* rad/s, corner */
+#define SEARCH_PULSE_W 15.0f /* rad/s before the angle taper, race SEARCH */
+#define SEARCH_SPEED_RATIO 0.90f
 #define CORNER_MAX_MPS 0.2f /* B only: 0 commands a pivot */
 #if CORNER_SLOW_MODE == 1
 #define CORNER_PULSE_W CORNER_B_PULSE_W
@@ -190,15 +191,15 @@
    FINISH_SECTION(speed, bar_count, distance_after_last_bar_m)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.85f, 2),
-    [S2]  = ISLAND_SECTION(0.85f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.85f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.85f, 2, 0.8f, 3.50f),
-    [S5]  = CROSS_SECTION(0.85f, 2),
-    [S6]  = CROSS_SECTION(0.85f, 2),
-    [S7]  = CROSS_SECTION(0.85f, 2),
-    [S8]  = ISLAND_SECTION(0.85f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.85f),
-    [S10] = FINISH_SECTION(0.85f, 1, COURSE_PARK_DISTANCE_M)
+    [S1]  = CROSS_SECTION(0.90f, 2),
+    [S2]  = ISLAND_SECTION(0.90f, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(0.90f, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(0.90f, 2, 0.8f, 3.50f),
+    [S5]  = CROSS_SECTION(0.90f, 2),
+    [S6]  = CROSS_SECTION(0.90f, 2),
+    [S7]  = CROSS_SECTION(0.90f, 2),
+    [S8]  = ISLAND_SECTION(0.90f, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(0.90f),
+    [S10] = FINISH_SECTION(0.90f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
