@@ -28,7 +28,10 @@
 #define SEARCH_SWEEP_SPEED_MPS 0.0f
 #define SEARCH_SWEEP_W_RAD_S 8.5f
 #define SEARCH_SWEEP_DIR 1 /* +1 left, -1 right */
-#define COURSE_PULSE_TAPER_RAD 1.659f /* zero at 90 degrees */
+#define COURSE_PULSE_TAPER_RAD 1.659f /* reaches the terminal rate at approximately 95 degrees */
+#define COURSE_S1_FIRST_BEND_TAPER_RAD 0.78539816f /* 45 degrees */
+#define COURSE_PULSE_OPTICAL_GAIN 10.0f /* extra taper near the centre of one visible line */
+#define COURSE_PULSE_OPTICAL_FILTER_MS 10.0f /* first-order filter time constant */
 #define COURSE_TOTAL_MS 480000u
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
@@ -54,7 +57,7 @@
      re-acquires too early      -> increase COURSE_GAP_MIN_M
      turns the wrong way        -> set DIR -1                              */
 #define COURSE_GAP_TURN_ENABLE 1   /* 1 = new right-turn behaviour; 0 = old straight */
-#define COURSE_GAP_TURN_RAD 0.60f  /* target yaw offset, rad (~20 deg) */
+#define COURSE_GAP_TURN_RAD 0.55f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
@@ -65,10 +68,10 @@
 #ifndef CORNER_SLOW_MODE
 #define CORNER_SLOW_MODE 0 /* 0: A, cruise through turns; 1: B, apply corner speed cap */
 #endif
-#define CORNER_A_PULSE_W 12.8f  /* rad/s, corner */
+#define CORNER_A_PULSE_W 15.5f  /* rad/s, corner */
 #define CORNER_B_PULSE_W 7.5f /* rad/s, corner */
-#define SEARCH_PULSE_W 15.0f /* rad/s before the angle taper, race SEARCH */
-#define SEARCH_SPEED_RATIO 0.90f
+#define SEARCH_PULSE_W 25.5f /* rad/s before the angle taper, race SEARCH */
+#define SEARCH_SPEED_RATIO 0.52f
 #define CORNER_MAX_MPS 0.2f /* B only: 0 commands a pivot */
 #if CORNER_SLOW_MODE == 1
 #define CORNER_PULSE_W CORNER_B_PULSE_W
@@ -81,8 +84,15 @@
 #define S10_ZIGZAG_CLEAR_MS 300u
 #define S10_ZIGZAG_MIN_M 1.40f /* distance from the second confirmed corner */
 #define COURSE_RACE_LAPS 2u
-#define COURSE_CORNER_EXIT_LEAD_DEG 40u /* lead for mapped 90-degree corners */
+#define COURSE_CORNER_ANGLE_EXIT_ENABLE 1 /* 1 enables mapped corner angle exit */
+#define COURSE_CORNER_EXIT_LEAD_DEG 50u /* lead for mapped 90-degree corners */
 #define COURSE_RIGHT_ANGLE_BRAKE_MS 25u /* hold zero yaw rate after release */
+#ifndef PULSE_EXIT_BRAKE_TEST
+#define PULSE_EXIT_BRAKE_TEST 0 /* 0: A; 1: B, reverse pulse braking */
+#endif
+#define PULSE_EXIT_BRAKE_MS 10u
+#define COURSE_PULSE_MIN_W 0.5f /* terminal angular rate for tapered pulses, rad/s */
+#define PULSE_EXIT_BRAKE_W 1.0f /* rad/s */
 #ifndef COURSE_RIGHT_ANGLE_TEST
 #define COURSE_RIGHT_ANGLE_TEST 0 /* 0: A, normal drive; 1: B, slow confirmed right angles */
 #endif
@@ -108,7 +118,7 @@
 #define TURN_FIT_SAMPLES 5
 #define TURN_FIT_MIN_SPAN_M 0.020f
 #define TURN_FIT_MAX_RMS_M 0.003f
-#define CORNER_COAST_TIME_MS 30u
+#define CORNER_COAST_TIME_MS 10u
 #define CORNER_FLOW_MIN_SHIFT 1.0f /* sensor pitches across the sample window */
 #ifndef CORNER_PREDICT_EXIT
 #define CORNER_PREDICT_EXIT 1 /* 0: original release; 1: also predict centre crossing */
@@ -153,8 +163,8 @@
 #ifndef SPECIAL_ISLAND_HOLD_MS
 #define SPECIAL_ISLAND_HOLD_MS 30u /* heading hold and retrigger lockout */
 #endif
-#define ORDINARY_EXIT_SIDE_DELAY_MS 10u /* from exit fall-back to exit-side selection */
-#define ORDINARY_PULSE_DELAY_MS 10u /* from exit fall-back to exit pulse */
+#define ORDINARY_EXIT_SIDE_DELAY_MS 0u /* from exit fall-back to exit-side selection */
+#define ORDINARY_PULSE_DELAY_MS 0u /* from exit fall-back to exit pulse */
 #define ORDINARY_ELEMENT_UNLOCK_RAD 0.17266463f /* 50 degrees */
 #define ISLAND_EXIT_PULSE_RAD 0.2617994f /* 15 degrees */
 #define ISLAND_EXIT_SINGLE_MS 20u /* single-line dwell for S8 and small-ring entry/exit */
@@ -191,15 +201,15 @@
    FINISH_SECTION(speed, bar_count, distance_after_last_bar_m)
    S1..S10 are array labels; COURSE_START_SEGMENT remains human 1..10. */
 static const CourseSegment course_map[10]={
-    [S1]  = CROSS_SECTION(0.90f, 2),
-    [S2]  = ISLAND_SECTION(0.90f, PICK_LEFT, PICK_RIGHT),
-    [S3]  = CROSS_SECTION(0.90f, 2), /* octagon: CROSS entry and return */
-    [S4]  = GAP_SECTION(0.90f, 2, 0.8f, 3.50f),
-    [S5]  = CROSS_SECTION(0.90f, 2),
-    [S6]  = CROSS_SECTION(0.90f, 2),
-    [S7]  = CROSS_SECTION(0.90f, 2),
-    [S8]  = ISLAND_SECTION(0.90f, PICK_RIGHT, PICK_LEFT),
-    [S9]  = EIGHT_SECTION(0.90f),
-    [S10] = FINISH_SECTION(0.90f, 1, COURSE_PARK_DISTANCE_M)
+    [S1]  = CROSS_SECTION(1.0f, 2),
+    [S2]  = ISLAND_SECTION(1.0f, PICK_LEFT, PICK_RIGHT),
+    [S3]  = CROSS_SECTION(1.0f, 2), /* octagon: CROSS entry and return */
+    [S4]  = GAP_SECTION(1.0f, 2, 0.8f, 3.50f),
+    [S5]  = CROSS_SECTION(1.0f, 2),
+    [S6]  = CROSS_SECTION(1.0f, 2),
+    [S7]  = CROSS_SECTION(1.0f, 2),
+    [S8]  = ISLAND_SECTION(1.0f, PICK_RIGHT, PICK_LEFT),
+    [S9]  = EIGHT_SECTION(1.0f),
+    [S10] = FINISH_SECTION(1.0f, 1, COURSE_PARK_DISTANCE_M)
 };
 #endif
