@@ -675,13 +675,21 @@ static float course_gap_target_yaw;
 #include "course_elements.h"
 #if COURSE_ELEMENT_MODE
 static float element_speed;
+static float element_applied_speed;
+static uint32_t element_accel_started;
+static int element_accel_waiting;
 static unsigned element_index, element_segment, element_pass, element_hits;
 static float element_start_s;
 static void update_element_speed(int confirmed,int active){
     const unsigned count=sizeof(course_elements)/sizeof(course_elements[0]);
     element_speed=COURSE_ELEMENT_DEFAULT_MPS;
-    if(course_wait_start || course_final){element_segment=0;return;}
+    if(course_wait_start || course_final){
+        if(course_wait_start)element_speed=COURSE_START_ZONE_MPS;
+        element_segment=0;
+        return;
+    }
     if(element_segment!=course_segment || element_pass!=course_pass){
+        element_accel_waiting=0;
         element_segment=course_segment;element_pass=course_pass;
         element_index=0;element_hits=0;element_start_s=course_last_event_s;
         while(element_index<count && (course_elements[element_index].segment!=element_segment ||
@@ -699,6 +707,7 @@ static void update_element_speed(int confirmed,int active){
         else if(e[1].kind==ELEMENT_GAP)advance=course_gap;
         else advance=e[1].kind==ELEMENT_ISLAND && track_state==BRANCH;
         if(advance){
+            element_accel_waiting=0;
             element_index++;e++;
             element_start_s=app_s;element_hits=(confirmed && e->bends)?1u:0u;
         }
@@ -2097,9 +2106,6 @@ static void app_start(void){
     app_elapsed=app_hold=app_quarter=app_lost=app_settled=app_stall=0;
     track_reset();steer_test_e_prev=0;steer_test_d_ready=0;
     scope_bend_frames=0;
-#if COURSE_ELEMENT_MODE
-    element_segment=0;
-#endif
     right_angle_braking=0;
     corner_release_reason=0;
     scope_bend_index=scope_bend_segment=scope_bend_pass=0;
@@ -2108,6 +2114,11 @@ static void app_start(void){
     mode7_active=0;mode7_steady_ms=0;mode7_run_ms=0;
     app_last_completed=app_ms;app_running=1;
     elem_test_reset();course_begin();
+#if COURSE_ELEMENT_MODE
+    element_segment=0;
+    element_applied_speed=course_wait_start ? COURSE_START_ZONE_MPS : COURSE_ELEMENT_DEFAULT_MPS;
+    element_accel_waiting=0;
+#endif
 #if SEARCH_SWEEP_TEST
     sweep_phase=0;sweep_heading=app_yaw;
 #endif
@@ -2251,6 +2262,20 @@ static void app_control(float gz_rad){
         float previous_element_speed=element_speed;
         update_element_speed(bend_confirmed_now,scope_bend_frames>=2u);
         if(v==previous_element_speed)v=element_speed;
+        if(element_speed<=element_applied_speed){
+            element_applied_speed=element_speed;
+            element_accel_waiting=0;
+        }else{
+            if(!element_accel_waiting){
+                element_accel_started=app_elapsed;
+                element_accel_waiting=1;
+            }
+            if(app_elapsed-element_accel_started>=COURSE_ELEMENT_ACCEL_WAIT_MS){
+                element_applied_speed=element_speed;
+                element_accel_waiting=0;
+            }
+        }
+        element_speed=element_applied_speed;
 #endif
         course_limit(&v,&w);if(!app_running)return;
 #if COURSE_ELEMENT_MODE

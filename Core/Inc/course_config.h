@@ -34,7 +34,7 @@
 #define COURSE_SEGMENT_MS 90000u
 #define COURSE_REARM_M 0.02f
 #define COURSE_REARM_MS 30u
-#define S9_FORK_BLOCK_M 0.80f /* metres from S9 entry; 0 disables */
+#define S9_FORK_BLOCK_M 0.0f /* metres from S9 entry; 0 disables */
 #define COURSE_GAP_SPEED 0.85f
 #define COURSE_GAP_MIN_M 0.40f /* reject an early short blank as successful gap traversal */
 #define COURSE_GAP_MAX_M 2.00f /* 0.65 m nominal blank + tolerance; NOT measured wheel travel */
@@ -55,7 +55,7 @@
      re-acquires too early      -> increase COURSE_GAP_MIN_M
      turns the wrong way        -> set DIR -1                              */
 #define COURSE_GAP_TURN_ENABLE 1   /* 1 = new right-turn behaviour; 0 = old straight */
-#define COURSE_GAP_TURN_RAD 0.62f  /* target yaw offset, rad (~20 deg) */
+#define COURSE_GAP_TURN_RAD 0.75f  /* target yaw offset, rad (~20 deg) */
 #define COURSE_GAP_TURN_DIR 1      /* +1 = right, -1 = left */
 #define COURSE_GAP_TURN_W 1.20f    /* max |w| while rotating, rad/s */
 /* From the completed finish-line crossing to motor cut-off, in metres. */
@@ -156,7 +156,7 @@
 #define ORDINARY_PULSE_DELAY_MS 10u /* from exit fall-back to exit pulse */
 #define ORDINARY_ELEMENT_UNLOCK_RAD 0.17266463f /* 50 degrees */
 #define ISLAND_EXIT_PULSE_RAD 0.2617994f /* 15 degrees */
-#define ISLAND_EXIT_SINGLE_MS 50u /* single-line dwell for S8 and small-ring entry/exit */
+#define ISLAND_EXIT_SINGLE_MS 20u /* single-line dwell for S8 and small-ring entry/exit */
 #define ISLAND_SPECIAL_ENTRY_FORK_FRAMES 2u /* S8 and figure-eight small-ring entry */
 #define S8_EXIT_FORK_FRAMES 2u /* consecutive valid forks to arm the S8 exit */
 #define S2_EXIT_MIN_M 0.70f /* S2 exit fork gate, metres from island entry; 0 disables */
