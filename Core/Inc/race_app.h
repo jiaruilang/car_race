@@ -106,6 +106,10 @@ static unsigned app_tx_pos, app_tx_len;
    5 lost line;6 timeout;7 encoder jump;8 stall. Reset to clear fault. */
 static float app_clip(float x,float lo,float hi){return x<lo?lo:x>hi?hi:x;}
 static void App_Stop(void){
+#if IF_start_Brushless_motor
+    fan_requested=0;
+    fan_stable_frames=0;
+#endif
     TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;
     app_il=0;app_ir=0;app_cmd_l=0;app_cmd_r=0;
     app_target_l=0;app_target_r=0;
@@ -119,6 +123,9 @@ static int32_t app_delta(uint16_t n,uint16_t p){
 static void App_Timer1ms(void){
     ++app_ms;
     if(app_running && (uint32_t)(app_ms-app_last_completed)>20u){
+#if IF_start_Brushless_motor
+        fan_requested=0;
+#endif
         TIM1->CCR1=0;TIM1->CCR2=0;app_running=0;app_fault=3;
     }
 }
@@ -558,7 +565,9 @@ static int island_pulse_centered(int start,int end){
 /* Cubic taper from full rate to the terminal rate. */
 static float pulse_scale_for_turn(float turned,float taper_rad){
     float x=app_clip(turned/taper_rad,0.0f,1.0f);
-    return fmaxf(0.0f,1.0f+x*(-1.22f+x*(0.285f-0.065f*x)));
+    float scale=1.0f+x*(-1.22f+x*(0.285f-0.065f*x));
+    /* Reduce the mid-turn rate while preserving both endpoints. */
+    return fmaxf(0.0f,scale-0.24f*x*(1.0f-x));
 }
 
 static float pulse_line_nearness;
@@ -2682,6 +2691,16 @@ __attribute__((noinline)) static void App_Poll(void){
     uint32_t now=app_ms,gap=now-app_last_sample;
     struct bmi2_sens_data acc,gyr;
     uint16_t l,r;int32_t dl,dr;unsigned key;
+    /* Single-byte stop works during spin-up and while telemetry is active. */
+    if(huart3.Instance->SR & (USART_SR_RXNE | USART_SR_ORE)){
+        if((uint8_t)huart3.Instance->DR=='!'){
+            App_Stop();
+            app_key_stable=0;
+            app_key_prev=0;
+            app_key_ticks=0;
+            return;
+        }
+    }
     app_log();
     if(app_fault || gap<5u)return;
     app_last_sample=now;
@@ -2718,8 +2737,20 @@ __attribute__((noinline)) static void App_Poll(void){
     else{app_key_ticks=0;app_key_prev=key;}
     if(app_key_ticks>=4 && key!=app_key_stable){
         app_key_stable=key;
-        if(!key){if(app_running)App_Stop();else app_start();}
+        if(!key){
+#if IF_start_Brushless_motor
+            if(app_running || fan_requested)App_Stop();
+            else if(!app_cal_ready || (APP_MODE>=3 && !app_parameters_ok()))app_fail(4);
+            else fan_requested=1;
+#else
+            if(app_running)App_Stop();else app_start();
+#endif
+        }
     }
+#if IF_start_Brushless_motor
+    if(fan_requested && !app_running && fan_stable_frames>=ESC_STABLE_PERIODS)
+        app_start();
+#endif
     if(app_running && (uint32_t)(app_ms-now)>2u){app_fail(3);return;}
     app_control((app_gz-app_bias)*GYRO_SIGN*PI_F/180.0f);
     app_last_completed=app_ms;

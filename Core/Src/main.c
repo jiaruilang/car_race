@@ -39,7 +39,9 @@
    MDK-Lite 的 32 kB 链接上限会因此报 L6047U 而链接失败。
    平时保持 0；要串口看数据时改成 1（并注意镜像大小）。 */
 #define GYRO_DEBUG 0
-#define IF_start_Brushless_motor 0 //是否启动无刷电机，1为启动，0为不启动
+#ifndef IF_start_Brushless_motor
+#define IF_start_Brushless_motor 0
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,6 +61,9 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+#if IF_start_Brushless_motor
+#define ESC_STABLE_PERIODS 100U /* run throttle for 2 seconds before launch */
+static volatile unsigned fan_requested, fan_stable_frames;
 //负压启动相关宏
 //负压启动流程：900us脉宽50Hzpwm信号输出2秒后，改为持续2000us脉宽50Hzpwm信号输出
 #define ESC_PULSE_SLOTS       200U       /* 20 ms at the 10 kHz TIM1 update rate */
@@ -106,35 +111,21 @@ static void ESC_SetPulseWidth(uint32_t high_slots)
   }
   esc_high_slots = high_slots;
 }
-static void ESC_fullPulseWidth(void){
-  uint32_t i;
-  for (i = 0U; i < ESC_PULSE_SLOTS; ++i)
-  {
-    esc_dma_table[i] = GPIO_PIN_11;
-  }
-  esc_high_slots = ESC_PULSE_SLOTS;
-}
-/* One interrupt per 20 ms frame: DMA transfer complete in circular mode.
-   The 50 Hz waveform itself is produced by TIM1 + DMA in hardware; this
-   handler only counts frames and switches 0.9 ms -> 2.0 ms after 2 s. */
 static void ESC_DmaTransferComplete(DMA_HandleTypeDef *hdma)
 {
-  if (esc_period_count < ESC_START_PERIODS)
-  {
+  (void)hdma;
+  if (esc_period_count < ESC_START_PERIODS) {
     ++esc_period_count;
-    if (esc_period_count == ESC_START_PERIODS)
-    {
-      /* The frame that has just been completed was the last 0.9 ms frame:
-         100 x 20 ms = 2 s have elapsed, 2.0 ms is now held forever. */
-      if (!IF_start_Brushless_motor)
-        ESC_SetPulseWidth(10U);
-      else
-        ESC_SetPulseWidth(ESC_RUN_PULSE_SLOTS);
-      /* Nothing left to time, so stop the 50 Hz interrupt. */
-      __HAL_DMA_DISABLE_IT(hdma, DMA_IT_TC);
-    }
+    if (esc_period_count < ESC_START_PERIODS) return;
   }
+  if (fan_requested && esc_high_slots == ESC_RUN_PULSE_SLOTS) {
+    if (fan_stable_frames < ESC_STABLE_PERIODS) ++fan_stable_frames;
+  } else {
+    fan_stable_frames = 0;
+  }
+  ESC_SetPulseWidth(fan_requested ? ESC_RUN_PULSE_SLOTS : 10U);
 }
+#endif
 
 /* USER CODE END PV */
 
@@ -162,7 +153,8 @@ int fputc(int ch, FILE *f)
 }
 float gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z; // 陀螺仪数据
 /* USER CODE END 0 */
-void Init_brushless_motor(void)
+#if IF_start_Brushless_motor
+static void Init_brushless_motor(void)
 {
   /* PA11 idles low: the first high level then also lasts exactly 0.9 ms,
      because the DMA writes the first slot 0.1 ms after TIM1 is started. */
@@ -174,12 +166,8 @@ void Init_brushless_motor(void)
     Error_Handler();
   __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
   __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
-  if (IF_start_Brushless_motor)
-    while (esc_period_count < ESC_START_PERIODS)
-      HAL_Delay(200);//等待无刷电桥负压启动完成
-  /* Disabled fan: return immediately; DMA completes the existing
-     0.9 ms -> 1.0 ms idle-signal sequence in the background. */
 }
+#endif
 /**
  * @brief  The application entry point.
  * @retval int
@@ -218,7 +206,9 @@ int main(void)
   MX_TIM4_Init();
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  Init_brushless_motor(); //等待无刷电调负压启动完成
+#if IF_start_Brushless_motor
+  Init_brushless_motor();
+#endif
   /* USER CODE BEGIN 2 */
   App_Init();
 
